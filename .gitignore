@@ -1,0 +1,12 @@
+# 数据集与训练产物不进 git（体积大，且可随时重新下载/生成）
+data/
+artifacts/
+
+# 官方 benchmark 代码（上游 yandex/yambda，Apache-2.0；克隆方式与上游版本见 docs/benchmark_repro.md）
+/vendor/
+
+# 本地环境与缓存
+.venv/
+__pycache__/
+*.py[cod]
+.DS_Store

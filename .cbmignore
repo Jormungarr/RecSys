@@ -1,0 +1,3 @@
+# 让 codebase-memory 索引 scripts/ 与 docs/（内置 skip-list 默认排除，用 ! 放回）
+!scripts/
+!docs/
