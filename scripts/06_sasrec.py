@@ -15,6 +15,10 @@
   `(桶数 × EMB)` 的表，加到 item / 位置 embedding 上。Δ 与 itemknn 的“该用户最后一次 − 该次时间”同义；
   训练与推理的查询位置都恰好是 Δ = 0，口径一致、不泄露未来。**2026-09-21 试过一版：val 全指标变差（见
   `docs/baselines.md`），所以 `USE_TIME_FEATURE` 默认 False。**
+- **相对时间偏置（本机加的，官方实现没有；`USE_TIME_BIAS`，默认开）**：把可学的 `b[Δt 桶]`（按 head 分开）
+  加到**注意力分数**上，`Δt = t_i − t_j`、参照点是查询位自身（训练位置 i 预测 i+1，只用 i 时刻已知的时间）。
+  与上一条的区别：Δ 进的是注意力 logits（成对量），不是 token 表示（那是绝对新鲜度、已被位置 embedding 覆盖）。
+  桶边界用本机 `TIME_BOUNDS`（对数 13 桶，不是参考实现那个 `max_interval=1024` 秒线性截断，见 `docs/baselines.md`）。
 - 训练样本（`data.py::TrainDataset`）：item = seq[:-1]、positive = seq[1:]（每个位置都预测下一首），
   负样本**每个位置随机 1 个**；损失 = BCEWithLogits([正分; 负分], [1; 0])
 - 超参（`train.py` 的默认值）：heads 2 / layers 2 / dropout 0.0 / lr 1e-3 / Adam / batch 256 / seed 42；
@@ -84,6 +88,13 @@ TIME_BOUNDS = (5, 15, 60, 300, 1800, 7200, 21600, 86400, 259200, 604800, 1814400
 N_TIME_BUCKETS = len(TIME_BOUNDS) + 1
 USE_TIME_FEATURE = False  # Δ 时间特征开关：2026-09-21 在 d64/seq512 上试过，val 全指标变差（见 docs/baselines.md），默认关
                         # 要复现那版改成 True 重跑（checkpoint 里有无 time_embedding 必须与开关一致，下有守卫）
+USE_TIME_BIAS = False  # 相对时间偏置开关：b[Δt 桶]（可学，按 head 分开）加到注意力分数上，Δt = t_i − t_j、参照查询位自身
+                      # 与上面那版的区别：Δ 进的是**注意力 logits**（成对量），不是 token 表示（绝对新鲜度）。
+                      # 出处：HSTU 的 rab_{p,t}、GenRank 的 ALiBi 式 bias（reference/fun-rec chapter_6_scaling）。
+                      # **2026-09-21 在 d64/seq512 上试过一版：val 全指标小幅变差（recall@100 0.100252 → 0.095807，
+                      # 回访 −4.9%、新歌 −2.8%），但学出的 b 表本身是干净的单调衰减（1min–30min 最高、6 桶后单调降到 −1.4）
+                      # → 先验没错，是它和位置 embedding 重复且更弱。见 docs/baselines.md。默认 False。**
+                      # checkpoint 里有无 time_bias 必须与开关一致，下有守卫。
 SPLIT = sys.argv[1] if len(sys.argv) > 1 else "val"  # 模式：val（训练+评 val）/ test（复用 checkpoint 评 test）/ train（口径 B：训练+评 test）
 assert not (SPLITS_ID == "b" and SPLIT == "val"), "版本 B 没有 val（val_size = 0）；用 train 训练、用 test 复用 B 的 checkpoint"
 EVAL_SPLIT = "test" if SPLIT == "train" else SPLIT  # 本次评测的窗口
@@ -112,7 +123,7 @@ def train_sequences(train: pd.DataFrame, n_users: int) -> list[np.ndarray]:
 
 
 def train_timestamps(train: pd.DataFrame, n_users: int) -> list[np.ndarray]:
-    """每用户一条 timestamp 序列（与 train_sequences 同样的截断），供 Δ 时间特征用。"""
+    """每用户一条 timestamp 序列（与 train_sequences 同样的截断），供 Δ 与成对 Δt 两种时间特征用。"""
     return by_user(train, "timestamp", n_users)
 
 
@@ -137,13 +148,39 @@ def delta_buckets(times: np.ndarray) -> np.ndarray:
     return np.digitize(times[-1] - times, TIME_BOUNDS).astype(np.int64)
 
 
-def pad_deltas(times: list[np.ndarray], users: np.ndarray) -> torch.Tensor:
-    """左填充到 MAX_SEQ_LEN 的 Δ 桶编号（与 pad_sequences 同样的对齐；padding 位填 0，反正会被 mask 掉）。"""
-    delta = np.zeros((len(users), MAX_SEQ_LEN), dtype=np.int64)
+def pad_times(times: list[np.ndarray], users: np.ndarray) -> torch.Tensor:
+    """左填充到 MAX_SEQ_LEN 的**原始时间戳**（与 pad_sequences 同样的对齐）。
+
+    int32 装得下（时间戳 ~2.6e7），比 int64 省一半内存。两种时间特征都在模型里用这份原始时间戳现算，
+    所以它替掉了原来那路“已分桶的 Δ”（dataset 里不再预先分桶）。
+    """
+    stamps = np.zeros((len(users), MAX_SEQ_LEN), dtype=np.int32)
     for row, uid in enumerate(users):
-        buckets = delta_buckets(np.asarray(times[uid]))
-        delta[row, MAX_SEQ_LEN - len(buckets) :] = buckets
-    return torch.from_numpy(delta)
+        stamp = np.asarray(times[uid])[-MAX_SEQ_LEN:].astype(np.int32)
+        stamps[row, MAX_SEQ_LEN - len(stamp) :] = stamp
+    return torch.from_numpy(stamps)
+
+
+def delta_buckets_tensor(times: torch.Tensor) -> torch.Tensor:
+    """(B, 512) 时间戳 → 「距该行最后一次事件多久」的桶编号，等价于原来在 dataset 里算的那版 Δ。
+
+    行内最后一次事件就是参照点：训练时该行是输入序列（窗口去掉最后一条），推理时该行是整条窗口——两种情况下
+    参照点都恰好是「最新已知的那次事件」，与旧实现（逐样本 `delta_buckets(times[:-1])`）一致。
+    """
+    bounds = torch.tensor(TIME_BOUNDS, dtype=torch.int32, device=times.device)
+    # right=True 是为了与 numpy 的 `np.digitize`（区间左闭右开）对齐，否则恰好落在边界上的 Δ 会差一档
+    return torch.bucketize(times[:, -1:] - times, bounds, right=True, out_int32=True)
+
+
+def pairwise_buckets(times: torch.Tensor) -> torch.Tensor:
+    """(B, 512) 时间戳 → (B, 512, 512) 的 Δt 桶编号，Δt = t_i − t_j（i = 查询位，j = key 位）；供 `USE_TIME_BIAS` 用。
+
+    参照点是**查询位自身**，不是窗口末尾：位置 i 预测 i+1，用到的全是 i 时刻已知的时间，不泄未来。
+    因果 + 左填充下 Δt 恒 ≥ 0，所以不需要参考实现那个 abs。
+    """
+    bounds = torch.tensor(TIME_BOUNDS, dtype=torch.int32, device=times.device)
+    # right=True：与 np.digitize 同一套区间约定（见 delta_buckets_tensor）
+    return torch.bucketize(times[:, :, None] - times[:, None, :], bounds, right=True, out_int32=True)
 
 
 class AttentionBlock(nn.Module):
@@ -194,6 +231,8 @@ class SASRec(nn.Module):
         self.position_embedding = nn.Embedding(MAX_SEQ_LEN, EMB)
         if USE_TIME_FEATURE:
             self.time_embedding = nn.Embedding(N_TIME_BUCKETS, EMB)  # Δ 时间分桶（本机加的，官方没有）
+        if USE_TIME_BIAS:
+            self.time_bias = nn.Embedding(N_TIME_BUCKETS, HEADS)  # 相对时间偏置，按 head 分开（本机加的）
         self.layernorm = nn.LayerNorm(EMB, eps=1e-9)
         self.dropout = nn.Dropout(DROPOUT)
         self.encoder = Encoder()
@@ -209,13 +248,15 @@ class SASRec(nn.Module):
                     nn.init.trunc_normal_(value.data, std=INIT_RANGE, a=-2 * INIT_RANGE, b=2 * INIT_RANGE)
             else:
                 nn.init.zeros_(value.data)
+        if USE_TIME_BIAS:
+            nn.init.zeros_(self.time_bias.weight)  # 从「没有偏置」起步：第一轮的行为就是 b ≡ 0 那版，便于对照
 
-    def forward(self, item: torch.Tensor, delta: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
-        """item / delta (B, 200) 已左填充 → (B, 200, EMB)。位置倒序编号：最新行为是 0。"""
+    def forward(self, item: torch.Tensor, times: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+        """item / times (B, 512) 已左填充 → (B, 512, EMB)。位置倒序编号：最新行为是 0。"""
         positions = torch.arange(MAX_SEQ_LEN - 1, -1, -1, device=item.device)
         embeddings = self.item_embedding(item) + self.position_embedding(positions)
         if USE_TIME_FEATURE:
-            embeddings = embeddings + self.time_embedding(delta)
+            embeddings = embeddings + self.time_embedding(delta_buckets_tensor(times))
         embeddings = self.dropout(self.layernorm(embeddings))
         # 加性浮点 mask：未来位与 padding 位填 -inf，等价于原先的（布尔因果掩码 + src_key_padding_mask）。
         # 建在 (B, heads, 512, 512) 上是为了后面能把相对时间偏置 in-place 加到同一块内存里，不必再要一份同尺寸张量。
@@ -232,11 +273,15 @@ class SASRec(nn.Module):
         attn_mask.diagonal(dim1=-2, dim2=-1).masked_fill_(
             (~mask)[:, None, :].expand(-1, HEADS, -1), 0.0
         )
+        if USE_TIME_BIAS:
+            # b[Δt 桶] 加到注意力分数上（不是取代点积）。Δt 的桶由原始时间戳按查询位参照现算，各层共用这一份：
+            # 每层重算等于把参考书里讲的 O(N²) 访存瓶颈乘上层数。
+            attn_mask += self.time_bias(pairwise_buckets(times)).permute(0, 3, 1, 2)
         return self.encoder(embeddings * mask.unsqueeze(-1), attn_mask.view(-1, MAX_SEQ_LEN, MAX_SEQ_LEN))
 
 
 class TrainDataset(Dataset):
-    """每个样本 = 一条序列的 (item, positive, negative, delta)，四者在同一批位置上一一对应。"""
+    """每个样本 = 一条序列的 (item, positive, negative, times)，四者在同一批位置上一一对应。"""
 
     def __init__(self, sequences: list[np.ndarray], times: list[np.ndarray], n_items: int) -> None:
         keep = [(seq, stamp) for seq, stamp in zip(sequences, times) if len(seq) >= 2]  # 至少两个物品才有“下一首”
@@ -252,30 +297,29 @@ class TrainDataset(Dataset):
         item = sequence[:-1]
         positive = sequence[1:]
         negative = np.random.randint(0, self.n_items, size=item.shape)  # 官方 randint(1, num_items+1)
-        # Δ 以**这条输入序列（= 窗口去掉最后一条）的最后一次事件**为参照，不是整条窗口：
-        # 这样训练与推理的查询位置都恰好是 Δ = 0，口径一致
-        delta = delta_buckets(self.times[index][:-1])
-        return item, positive, negative, delta
+        # 原始时间戳（与 item 同一个位置对齐）：Δ 与成对 Δt 都在模型里现算
+        stamps = self.times[index][:-1].astype(np.int32)
+        return item, positive, negative, stamps
 
 
 def collate(batch: list[tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]], pad_id: int):
     item = np.full((len(batch), MAX_SEQ_LEN), pad_id, dtype=np.int64)
     positive = np.full_like(item, pad_id)
     negative = np.full_like(item, pad_id)
-    delta = np.zeros_like(item)
+    times = np.zeros((len(batch), MAX_SEQ_LEN), dtype=np.int32)
     mask = np.zeros((len(batch), MAX_SEQ_LEN), dtype=bool)
-    for row, (sample_item, sample_positive, sample_negative, sample_delta) in enumerate(batch):
+    for row, (sample_item, sample_positive, sample_negative, sample_times) in enumerate(batch):
         n = len(sample_item)
         item[row, MAX_SEQ_LEN - n :] = sample_item
         positive[row, MAX_SEQ_LEN - n :] = sample_positive
         negative[row, MAX_SEQ_LEN - n :] = sample_negative
-        delta[row, MAX_SEQ_LEN - n :] = sample_delta
+        times[row, MAX_SEQ_LEN - n :] = sample_times
         mask[row, MAX_SEQ_LEN - n :] = True
     return (
         torch.from_numpy(item),
         torch.from_numpy(positive),
         torch.from_numpy(negative),
-        torch.from_numpy(delta),
+        torch.from_numpy(times),
         torch.from_numpy(mask),
     )
 
@@ -297,11 +341,11 @@ def train(sequences: list[np.ndarray], times: list[np.ndarray], n_items: int, pa
     for epoch in range(1, EPOCHS + 1):
         started = time.perf_counter()
         total = 0.0
-        for item, positive, negative, delta, mask in loader:
-            item, positive, negative, delta, mask = (
-                tensor.to(TRAIN_DEVICE) for tensor in (item, positive, negative, delta, mask)
+        for item, positive, negative, times, mask in loader:
+            item, positive, negative, times, mask = (
+                tensor.to(TRAIN_DEVICE) for tensor in (item, positive, negative, times, mask)
             )
-            query = model(item, delta, mask)[mask]
+            query = model(item, times, mask)[mask]
             positive_scores = (query * model.item_embedding(positive[mask])).sum(dim=-1)
             negative_scores = (query * model.item_embedding(negative[mask])).sum(dim=-1)
             loss = torch.nn.functional.binary_cross_entropy_with_logits(
@@ -353,6 +397,19 @@ def main() -> None:
     delta_demo = delta_buckets(times[int(np.argmax(lengths))])
     print(f"序列长度: 中位 {int(np.median(lengths))} / 最大 {lengths.max()} / 截断到 {MAX_SEQ_LEN}")
     print(f"时间特征: {N_TIME_BUCKETS} 个对数桶，边界 {TIME_BOUNDS}；最长序列的 Δ 桶分布前 10 = {delta_demo[:10].tolist()}")
+    if USE_TIME_BIAS:
+        # 开工前先看 Δt 桶的占用：确认 13 个桶都有样本、长桶不是只由 padding 撑起来的
+        sample = np.arange(min(64, n_users))
+        sample_mask = pad_sequences(sequences, sample, pad_id)[1].numpy()
+        pairs = (
+            sample_mask[:, :, None]
+            & sample_mask[:, None, :]
+            & np.tril(np.ones((MAX_SEQ_LEN, MAX_SEQ_LEN), dtype=bool))  # 因果：只算 j ≤ i
+        )
+        counts = np.bincount(pairwise_buckets(pad_times(times, sample)).numpy()[pairs], minlength=N_TIME_BUCKETS)
+        share = counts / counts.sum()
+        print(f"Δt 桶占用（前 {len(sample)} 个用户、两端都有效的配对共 {counts.sum():,} 对）:")
+        print("  " + "  ".join(f"{index}:{value:.1%}" for index, value in enumerate(share)))
 
     if TRAIN_FIRST:
         model = train(sequences, times, n_items, pad_id)
@@ -376,8 +433,21 @@ def main() -> None:
         assert USE_TIME_FEATURE == ("time_embedding.weight" in state), (
             f"{CHECKPOINT.name} 的时间特征与当前 USE_TIME_FEATURE={USE_TIME_FEATURE} 不一致：先重训或把开关改回来"
         )
+        assert USE_TIME_BIAS == ("time_bias.weight" in state), (
+            f"{CHECKPOINT.name} 的相对时间偏置与当前 USE_TIME_BIAS={USE_TIME_BIAS} 不一致：先重训或把开关改回来"
+        )
+        saved_layers = len({key.split(".")[2] for key in state if key.startswith("encoder.layers.")})
+        assert saved_layers == LAYERS, (
+            f"{CHECKPOINT.name} 是 {saved_layers} 层，而 LAYERS = {LAYERS}：换过层数后要先按当前配置重训一次"
+        )
         model.load_state_dict(state)
         print(f"复用 checkpoint: {CHECKPOINT.relative_to(ROOT)}（换 split 不重训）")
+
+    if USE_TIME_BIAS:
+        # 只有 13 × heads 个数，直接打出来看它有没有学出「越久远越不重要」的单调衰减
+        print(f"b[Δt 桶]（桶 0 最近，{N_TIME_BUCKETS} 桶 × {HEADS} head）:")
+        for index, row in enumerate(model.time_bias.weight.detach().cpu().numpy()):
+            print(f"  {index:>2}  " + "  ".join(f"{value:+.5f}" for value in row))
 
     target_users, target_chunks = split_by_user(target.uid.to_numpy(), target.item_id.to_numpy())
     print(f"{EVAL_SPLIT:<5} {len(target):,} 行 / {len(target_users):,} 个有目标的用户")
@@ -391,7 +461,7 @@ def main() -> None:
 
     model.eval()
     item_tensor, mask = pad_sequences(sequences, np.arange(n_users), pad_id)
-    delta_tensor = pad_deltas(times, np.arange(n_users))
+    times_tensor = pad_times(times, np.arange(n_users))
     user_vectors = np.empty((n_users, EMB), dtype=np.float32)
     with torch.no_grad():
         # 按用户分批：模型对每个用户独立，分批不改变结果，只是把 (B, heads, L, L) 的注意力矩阵压到能放下
@@ -399,7 +469,7 @@ def main() -> None:
             stop = min(start + INFER_BATCH, n_users)
             embeddings = model(
                 item_tensor[start:stop].to(INFER_DEVICE),
-                delta_tensor[start:stop].to(INFER_DEVICE),
+                times_tensor[start:stop].to(INFER_DEVICE),
                 mask[start:stop].to(INFER_DEVICE),
             )
             # 左填充 → 最后一格就是最新行为
