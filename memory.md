@@ -21,14 +21,23 @@
 10. sasrec 基线：自己实现（torch 2.14.0），50 epoch / 329.8 秒，前向与官方 checkpoint 逐位一致 → `scripts/06_sasrec.py`、`docs/baselines.md`
 11. val / test 两个窗口的指标跑齐：三个脚本加 `split` 参数（`04/05` 还可再带一个 hour），test 上用 val 选出的档、不重跑网格，sasrec 复用 val 的 checkpoint → `README.md`、`docs/baselines.md`
 12. 版本 B 口径（`val_size=0`，能对官方表）：`02/04/05/06` 支持口径参数、产出 `artifacts/splits_b/`，三个基线跑齐并与官方 test 表逐项对照；并发掘出 coverage 在官方内部就不一致（已定：两条都报）→ `docs/baselines.md`、`architecture.md`、`README.md`
+13. **sasrec 重写注意力 block（加性浮点掩码），顺带查出一个评测缺陷**（2026-09-21）：`nn.TransformerEncoder` → 自写 `AttentionBlock` / `Encoder`（子模块同名，所以旧 checkpoint 两个实现都能装），掩码折成一个**加性浮点矩阵**。查出旧写法在 **eval 的 MHA fused fast path** 下给“整行被 mask 掉的 padding 行”返回 **NaN**，而那些 NaN 在第二层当 K/V 把**有效行**也污染 → 9,207 用户里 **2,321 个（历史 < 512，占 25.2%）** 用户向量为 NaN、评测被压低约 21%；`train` 模式不走那条路，所以训练一直正常（这正好解释了“为什么只有评测被压低”）。**修正后 d64/512：val recall@100 0.082480 → 0.100252、test 0.074404 → 0.090524、口径 B 0.076916 → 0.094515。**
+14. **相对时间偏置 `b[Δt桶]`**（参考书里 HSTU / GenRank 那一支）：可学、按 head 分开、加到注意力 logits 上（不取代点积），Δt 参照查询位自身。试过一次、**全指标变差**（val recall@100 0.100252 → 0.095807，回访 −4.9%、新歌 −2.8%，loss 持平）→ 开关 `USE_TIME_BIAS` 默认关。学出的 b 表本身是干净的单调衰减 → `docs/baselines.md`「相对时间偏置」。
+15. **容量包：emb 64→128 + 2 层→4 层**（两个旋钮一起改，经确认）：val recall@100 **0.100252 → 0.121823（+21.5%）**、test 0.090524 → **0.110816（+22.4%）**，全部指标 +19~30%；**sasrec 第一次在两个窗口都超过 itemknn**，新歌轴也不再输给 popularity（但新歌轴只领先 0.4%，很薄）。→ `scripts/06_sasrec.py` docstring、`docs/baselines.md`「容量包」。
+16. 归档：`docs/baselines.md` 逐处改正受缺陷影响的数字（seq 512 / 扩容两节加注意框、主表换成当前配置、口径 B 与官方对照重写、“低于官方 7.2%”改成“高 14.1%”）；README 的表与结论同步；排名融合**标为已作废、待重做**。
 
 **待办**
 
-- **sasrec 加时间特征（设计已想清，待扩容跑完再做）**：现在 sasrec **完全看不到时间**（`timestamp` 只用来排序）。可用的只有**相对**时间——官方隐了时间起点，所以**日周期 / 星期几这类绝对相位不可用**（`docs/eda.md`：相位不可知），能用的是「事件间隔」与「距当前多久」。三条候选：
+- ~~sasrec 加时间特征~~ → **两项都做完了，结论都是“变差”**（2026-09-21，细节见下面两条“已完成”）：① Δ 嵌入（进 token 表示）−5.6%、③ 的相对时间偏置（进注意力 logits）−4.4%，两个开关都留着、**默认关**；③ 会话边界经确认**不做**。下面那三条候选的原设计只作历史：
   ① **Δ 嵌入**（推荐先做）：每个位置带上“距序列最后一次事件多久”，按对数分桶（5s / 1min / 1h / 1d / 1w…）查一张 `(桶数 × EMB)` 表加到 item embedding 上——最接近 itemknn 的 `tau^Δ`（回访轴上最强的对手）。前提是把 timestamp 打通到 `TrainDataset` / `collate`（现在只传 item / positive / negative / mask）。
   ② **相对时间偏置**（到位版，参考书里 HSTU 那一支）：手写注意力，在 logits 上加 `b[Δ 桶]`，位置偏移与时间偏移**分开**建模（`nn.TransformerEncoder` 不支持加性偏置，要自己写 ~50 行）。
   ③ **会话边界**（便宜补充）：相邻间隔 > 30 分钟（`docs/eda.md` 的会话阈值）给一个分段 embedding——接近 DSIN 的会话内/会话间拆分。
   注意：`is_organic` / `played_ratio_pct` / `track_length_seconds` **不在**现有 artifacts 里（`02_build_splits.py` 只写了 uid/item_id/timestamp）——要用得重跑 02（约 1 分钟，A 与 B 都要）；这几个与时间无关，可以分开做。
+- **排名融合重做**：原来的 0.1081 用的是 d256 那版、在 NaN 缺陷下算出来的 top-100，**已作废**。现在 sasrec 单模型 test 已经 0.1108 且两条轴都第一，“融合还能不能再赚”要重新问（顺带：这次要不要把融合固化成脚本——上次它只是一次性核对）。
+- **dropout / 早停**：官方实现就是 dropout 0.0、无早停。容量包把 loss 从 0.0471 拉到 0.0252（−46.5%），指标也大涨，但这两件事靠“loss 降得比指标快”已经不能判断了（旧论据受缺陷污染，已作废）——要判断就得真加 dropout 跑一次对照。
+- **口径 B 的容量包**：目前 B 口径的 sasrec 还是 d64 / 2 层（`state_b.pt`，修正后 0.094515），最好那版没进 B。
+- **拆开 EMB 与层数**：容量包是一次改两个旋钮（经确认），要归因得再跑两次。
+- **多 seed**：现在所有 sasrec 数字都是单 seed 42；要谈“±几 % 算噪声”得重跑。
 - 基线：BPR（官方的 `bpr_als` 在本机跑不了——`implicit.gpu` 要 CUDA；要做得换 CPU 后端，属于改官方代码）
 - likes / dislikes 还没进管线（各自语义与时间轴不同，见 `docs/dataset_notes.md`）
 - 服务化（最后一步）
@@ -61,6 +70,11 @@
 | coverage 两条都报（全用户 + 有目标用户） | 官方自己在模型之间就不一致（popularity / itemknn 用全用户、sasrec 用有目标用户）；两条都报才能对每一张官方数字。`coverage(全用户)` 还与评测窗口无关 → `architecture.md`、`scripts/rec_eval.py` |
 | 长时训练用 `bg-train` skill 起，不用 `sleep + tail` 轮询 | 轮询每轮是一次完整 LLM 往返；skill 把渲染交给确定性进程，agent 只需“启动一次 + 长 poll 一次” → `~/.kun/skills/bg-train/SKILL.md` |
 | Δ 时间特征留成开关 `USE_TIME_FEATURE`（默认关） | 实测 val 全指标变差（`docs/baselines.md`），默认回到已知更好的配置；留开关是为了能复现那版 |
+| 自写 attention block（与 `nn.TransformerEncoderLayer` 同构，掩码用**加性浮点矩阵**） | 官方那头只吃布尔 mask、加不了加性偏置；顺带修掉 padding 行 NaN 污染评测的缺陷。子模块同名，所以旧 checkpoint 两个实现都能装 → `scripts/06_sasrec.py` |
+| padding 行必须留一个可见位（它自己的对角线） | 整行被 mask 时 softmax 是 0/0；旧写法在 eval 的 fused kernel 下返回 NaN，再顺着第二层的 K/V 污染有效行（实测 25.2% 用户中招）。把这条不变式写进代码注释，不依赖 PyTorch 内部行为 |
+| 相对时间偏置留成开关 `USE_TIME_BIAS`（默认关） | 与 Δ 时间特征是同一结论的两个方向（token 表示 / 注意力 logits）**都变差**；先验本身在 b 表上看得见，推断是与位置 embedding 重复 |
+| 容量包（emb 128 + 4 层）两个旋钮一起改 | 用户确认的合并；代价是两个旋钮互相归因不了（已写进文档）。效果是两次时间特征失败之后最大的一处提升（val +21.5% / test +22.4%） |
+| 发现评测缺陷后重读全部受影响数字，不照旧保留 | 缺陷使旧数字**系统性偏低**（约 21%，且不同配置污染比例不同）；两套口径、两个窗口、分轴数字全部重算或标注作废 |
 
 ## 本轮（2026-09-21）要点
 
@@ -96,7 +110,13 @@
 - **过拟合迹象**：训练 loss 0.0471 → **0.0257**（−45%），而 val recall@100 只涨 5.7% → 多出的容量有一部分花在背训练序列上。现在没有 dropout、没有早停（官方实现就是这样），这是“还能不能继续加容量”的前提。
 - 成本：59.4 秒/epoch（d64 是 12.7–15.4），50 epoch 总 2828.6 秒 ≈ 47 分钟（含 val 推理，机器没休眠）；带宽只涨约 4 倍而不是按参数量平方涨——d64 时的瓶颈不在矩阵计算。
 - 仍打不过 itemknn（test recall@100 0.079925 vs 0.098117，1.23×；改前 1.32×）。
-- 权重：`state.pt` 现为 **d256**（d64 那份已备份成 `state_l512_d64.pt`）；**口径 B 的 d256 还没跑**。归档：`docs/baselines.md` 新增「扩容：emb 64 → 256」一节，主表/并排表/回访-新歌表都换成了 d256。
+- 权重：`state.pt` 现为 **d256**（d64 那份已备份成 `state_l512_d64.pt`）；**口径 B 的 d256 还没跑**。归档：`docs/baselines.md` 新增「扩容：emb 64 → 256」一节，主表/并排表/回访-新歌表都换成了 d256。（注：这条与它下面的 d256 数字后来都受 NaN 缺陷影响，见下文。）
+- **手写注意力 block（第 1 步）**：`b ≡ 0` 时与旧实现逐位对照——这个对照原本是给重构兜底的，结果**抓出一个既有缺陷**（padding 行 NaN 污染有效行，见「已完成」13）。三条独立验证（旧实现关 fastpath、旧实现 train 模式、新实现）都给同一个数 **0.100252**，说明是旧实现在 eval 下那条路径的问题，不是重构引入的。
+- 顺带理顺产物语义：Δ 那版存成 `state_l512_d64_delta.pt`、`state.pt` 放当前最好配置；守卫加到 **5 处**（序列长度 / 维度 / 层数 / Δ 开关 / 相对时间偏置开关），实测能拦下错配的旧 checkpoint（可读提示，不再是 traceback）。
+- **相对时间偏置（第 2 步）**：Δt 进注意力 logits、按 head 分开、参照查询位自身；参照实现两处不能照抄（fun-rec 的 `attention_type` 默认没开这个偏置；它的桶边界是**原始秒 + max_interval=1024**，17 分钟以上全并成一档）。开工前三项检查：13 个桶都有实质样本、Δt 与旧 Δ 预分桶逐位等价（差 0）、完整 block0 复算差 4.8e-7。结果：全指标变差 −1.4~−4.9%，loss 持平；b 表是干净的单调衰减 → 先验没错、推断与位置 embedding 重复。
+- **容量包（第 4 步）**：emb 128 + 4 层一起上 → 两个窗口全部指标 +19~30%，**sasrec 首次在两个窗口都超过 itemknn**，新歌轴也追平 popularity（只领先 0.4%）；loss −46.5%。成本 51 秒/epoch、50 epoch 2703 秒。
+- **一处方法论更正**：d256 那次的“过拟合迹象”（loss −45%、val 只 +5.7%）是在**受污染的评测**下算的；修正后同样幅度的 loss 下降（−46.5%）对应 +21.5% 的 val 提升 → 那条论证作废，不能再用它当“该加 dropout”的理由（要判断得真跑对照）。
+- 排名融合 0.1081 **已作废**（输入是污染过的 top-100），标成“待重做”；口径 B 的 sasrec 那一格从“低于官方 7.2%”改成“高于官方 14.1%”，并注明两边配置不同、**不算复现一致**。
 
 ## 本轮（2026-09-20）要点
 
@@ -125,9 +145,9 @@
 - `artifacts/splits_b/`（gitignore）：版本 B（`val_size=0`）的切分，`train.parquet` 200.7 MB + `test.parquet` + 两张映射表；**没有 val**。
 - `artifacts/eda/`（gitignore）：6 张 PNG。
 - `scripts/05_itemknn.py`、`scripts/rec_eval.py`：只出终端数字，不落产物（itemknn 一档约 1 分 20 秒，13 档约 16 分钟）。
-- `artifacts/sasrec/`（gitignore）：`state.pt` = **d64+Δ**（最新那版，实测更差）；备份：`state_l512_d64.pt`（无 Δ 的 d64/512，文档里 d64 数字的来源）、`state_l512_d256.pt`（扩容那版 d256，**目前 val/test 最好**）、`state_l200.pt`（seq 200）、`state_b.pt`（口径 B / d64/512）。换序列长度、维度或时间特征开关都会让旧 checkpoint 装不回去（三处守卫）。
+- `artifacts/sasrec/`（gitignore）：`state.pt` = **当前最好配置（seq 512 / emb 128 / 4 层，val recall@100 0.121823 / test 0.110816）**；备份：`state_l512_d64.pt`（d64/512/2 层，修正后 d64 数字的来源）、`state_l512_d256.pt`（扩容那版 d256/2 层，数字受缺陷污染）、`state_l512_d64_delta.pt`（d64+Δ 那版）、`state_l512_d64_timebias.pt`（d64+相对时间偏置那版）、`state_l200.pt`（seq 200）、`state_b.pt`（口径 B / d64/512/2 层）。换序列长度、维度、层数、Δ 开关或相对时间偏置开关都会让旧 checkpoint 装不回去（**五处守卫**，给可读提示）。
 - `vendor/yambda-benchmarks/`（gitignore）：上游 clone，含自己那套 `.venv`。
-- 仓库有 2 个 commit（`4063f27` 初始化、`76bf298` val / test 双窗口）；之后口径 B、回访/新歌两桶、seq 512、d256、Δ 开关这些改动攒在工作区，于 2026-09-21 一并提交。
+- 仓库此时有 6 个 commit（`4063f27` 初始化 / `76bf298` val+test 双窗口 / `60084dc` 口径 B 那一批 + 修正过时的 git 状态描述 / `207e872` 自写注意力 block + NaN 修复 / `6d47d9c` 相对时间偏置 / `3fc582d` 容量包——后四个是 2026-09-21 这一轮里逐步提交的，每步一个 commit，便于回退）；文档归档另有一个 commit。
 
 ## 杂项
 
