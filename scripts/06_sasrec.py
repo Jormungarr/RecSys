@@ -9,7 +9,8 @@
 - 序列：每用户一条 item 序列（时间升序），取最后 max_seq_len 条（`data.py::preprocess`）；官方默认 200，
   本机改成 512（理由见 `MAX_SEQ_LEN` 处）
 - 模型（`model.py::SASRecEncoder`）：item embedding + 位置 embedding（倒序，最新为 0）+ **Δ 时间 embedding（本机加的，官方没有）**
-  → LayerNorm → Dropout → 2 层 TransformerEncoder（因果掩码 + padding 掩码）→ 取每序列最后一个有效位置的向量
+  → LayerNorm → Dropout → LAYERS 层自写 block（因果掩码 + padding 掩码；与 `nn.TransformerEncoderLayer` 同构，
+  自己拼是为了能往注意力分数上加**加性偏置**——TransformerEncoderLayer 只吃布尔 mask）→ 取每序列最后一个有效位置的向量
 - **时间特征（本机加的，官方实现没有；默认关）**：`Δ = 距该用户窗口内最后一次事件多久`（秒），对数分桶后查一张
   `(桶数 × EMB)` 的表，加到 item / 位置 embedding 上。Δ 与 itemknn 的“该用户最后一次 − 该次时间”同义；
   训练与推理的查询位置都恰好是 Δ = 0，口径一致、不泄露未来。**2026-09-21 试过一版：val 全指标变差（见
@@ -145,6 +146,45 @@ def pad_deltas(times: list[np.ndarray], users: np.ndarray) -> torch.Tensor:
     return torch.from_numpy(delta)
 
 
+class AttentionBlock(nn.Module):
+    """一个 post-norm 的 attention block，数学上与 nn.TransformerEncoderLayer 同构。
+
+    自己拼的唯一原因是那头只接受布尔 mask，而我们要往注意力分数上加**加性浮点偏置**（相对时间偏置）。
+    子模块命名与 nn.TransformerEncoderLayer 保持一致（self_attn / linear1 / linear2 / norm1 / norm2），
+    所以它那套 state_dict 在这儿能直接装——第 1 步就是靠这一点与旧实现逐位对照的。
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.self_attn = nn.MultiheadAttention(EMB, HEADS, dropout=DROPOUT, batch_first=True)
+        self.linear1 = nn.Linear(EMB, 4 * EMB)
+        self.linear2 = nn.Linear(4 * EMB, EMB)
+        self.norm1 = nn.LayerNorm(EMB, eps=1e-9)
+        self.norm2 = nn.LayerNorm(EMB, eps=1e-9)
+        self.dropout = nn.Dropout(DROPOUT)
+        self.dropout1 = nn.Dropout(DROPOUT)
+        self.dropout2 = nn.Dropout(DROPOUT)
+        self.activation = nn.GELU()
+
+    def forward(self, x: torch.Tensor, attn_mask: torch.Tensor) -> torch.Tensor:
+        attended = self.self_attn(x, x, x, attn_mask=attn_mask, need_weights=False)[0]
+        x = self.norm1(x + self.dropout1(attended))
+        return self.norm2(x + self.dropout2(self.linear2(self.dropout(self.activation(self.linear1(x))))))
+
+
+class Encoder(nn.Module):
+    """LAYERS 个 AttentionBlock；属性名取 `layers` 是为了与 nn.TransformerEncoder 的 state_dict 键一致。"""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.layers = nn.ModuleList(AttentionBlock() for _ in range(LAYERS))
+
+    def forward(self, x: torch.Tensor, attn_mask: torch.Tensor) -> torch.Tensor:
+        for layer in self.layers:
+            x = layer(x, attn_mask)
+        return x
+
+
 class SASRec(nn.Module):
     """官方 SASRecEncoder + 本机加的 Δ 时间 embedding：item + 位置 + 时间 → LayerNorm → Dropout → 因果 Transformer → 最后一格。"""
 
@@ -156,16 +196,7 @@ class SASRec(nn.Module):
             self.time_embedding = nn.Embedding(N_TIME_BUCKETS, EMB)  # Δ 时间分桶（本机加的，官方没有）
         self.layernorm = nn.LayerNorm(EMB, eps=1e-9)
         self.dropout = nn.Dropout(DROPOUT)
-        layer = nn.TransformerEncoderLayer(
-            d_model=EMB,
-            nhead=HEADS,
-            dim_feedforward=4 * EMB,
-            dropout=DROPOUT,
-            activation=nn.GELU(),
-            layer_norm_eps=1e-9,
-            batch_first=True,
-        )
-        self.encoder = nn.TransformerEncoder(layer, LAYERS)
+        self.encoder = Encoder()
         # 因果掩码注册成 buffer，.to(device) 时才会跟着走
         self.register_buffer(
             "causal", torch.triu(torch.ones(MAX_SEQ_LEN, MAX_SEQ_LEN, dtype=torch.bool), diagonal=1)
@@ -186,9 +217,22 @@ class SASRec(nn.Module):
         if USE_TIME_FEATURE:
             embeddings = embeddings + self.time_embedding(delta)
         embeddings = self.dropout(self.layernorm(embeddings))
-        return self.encoder(
-            embeddings * mask.unsqueeze(-1), mask=self.causal, src_key_padding_mask=~mask
+        # 加性浮点 mask：未来位与 padding 位填 -inf，等价于原先的（布尔因果掩码 + src_key_padding_mask）。
+        # 建在 (B, heads, 512, 512) 上是为了后面能把相对时间偏置 in-place 加到同一块内存里，不必再要一份同尺寸张量。
+        attn_mask = torch.zeros(
+            (item.shape[0], HEADS, MAX_SEQ_LEN, MAX_SEQ_LEN), dtype=embeddings.dtype, device=item.device
         )
+        attn_mask.masked_fill_(self.causal, float("-inf"))
+        attn_mask.masked_fill_((~mask)[:, None, None, :], float("-inf"))
+        # 给 padding 行留一个可见位（它自己的对角线）：整行都被 mask 掉时 softmax 是 0/0。
+        # 这不是洁癖——2026-09-21 査出：旧写法（布尔 mask + src_key_padding_mask）在 eval 的 MHA fused kernel 下
+        # 给整行被 mask 的 padding 行返回 NaN（train 模式走另一条路径，所以训练看起来正常），那些 NaN 又在第二层
+        # 当 K/V 把有效行的输出也污染成 NaN——9,207 个用户里 2,321 个（历史 < 512 的）中招，评测数字被压低 18% 左右。
+        # padding 行的输出反正不会被读（loss 只取 mask 位、评测只取最后一格），留个可见位只是为了让它保持有限值。
+        attn_mask.diagonal(dim1=-2, dim2=-1).masked_fill_(
+            (~mask)[:, None, :].expand(-1, HEADS, -1), 0.0
+        )
+        return self.encoder(embeddings * mask.unsqueeze(-1), attn_mask.view(-1, MAX_SEQ_LEN, MAX_SEQ_LEN))
 
 
 class TrainDataset(Dataset):
