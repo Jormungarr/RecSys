@@ -1,7 +1,8 @@
 """itemknn 基线：自己实现一份，评测口径对齐官方 benchmark。
 
 运行：
-    uv run python scripts/05_itemknn.py
+    uv run python scripts/05_itemknn.py                # 在 val 上扫 13 档 hour 网格并评测（约 16 分钟）
+    uv run python scripts/05_itemknn.py test 0.5       # 在 test 上评测，hour 直接用 val 选出的 0.5（约 1.5 分钟）
 
 口径出处（vendor/yambda-benchmarks/benchmarks/models/itemknn/main.py）：
 - C = 训练集「用户×物品」计数矩阵：同一 (uid, item) 的多次交互相加
@@ -22,11 +23,15 @@
 一到两个数量级，而外积走 BLAS。外积覆盖 W 的行集 × C 的**整列**（两者支撑不同：C(v, i) 与
 W(u, i) 不必同时非零），大物品按块组合、避免整列外积撑爆内存。
 
-注意：本脚本在 val 上评测（第一遍切分：train 截止 25,823,600，候选池 627,648）。
-官方最终 test 数字用的是第二遍训练集（val_size=0），本轮不产出。
+注意：第一遍切分的两个 future 窗口：val 用来选 hour，test 用来报告（候选池 627,648）。
+排序只由训练集决定（C 与 W 都只从 train 算），所以换 split 只换评测目标，top-100 不变。
+第二个参数是 hour：给了就跳过 13 档网格扫描。在 test 上评测时必须传 val 上选出的那一档，
+否则等于在 test 上选参。
+官方表格里的 test 数字用的是第二遍训练集（val_size=0），与本仓库切分不同，不能直接比。
 """
 
 import dataclasses
+import sys
 import time
 from pathlib import Path
 
@@ -44,6 +49,8 @@ HOURS = (0.0, 0.001, 0.002, 0.004, 0.008, 0.016, 0.032, 0.064, 0.128, 0.256, 0.5
 SELECT_K = 100  # 官方 --validation_metric 默认 ndcg@100
 ZERO_EPS = 1e-9  # 官方 eliminate_zeros 的阈值
 BLOCK = 512  # 外积分块的边长（要么两边都 ≤ BLOCK 直接算，要么按 BLOCK 切块两两组合）
+SPLIT = sys.argv[1] if len(sys.argv) > 1 else "val"  # 评测目标：val 或 test
+HOUR = float(sys.argv[2]) if len(sys.argv) > 2 else None  # 给了就跳过网格扫描
 
 
 @dataclasses.dataclass
@@ -144,7 +151,7 @@ def top_k(A: np.ndarray, Cn_t: sp.csr_matrix, batch: int = 128) -> np.ndarray:
 
 def main() -> None:
     train = load("train")
-    val = load("val")
+    target = load(SPLIT)
 
     n_users = int(train.uid.max()) + 1
     n_items = int(train.item_id.max()) + 1
@@ -161,28 +168,38 @@ def main() -> None:
     Cn.data = Cn.data / scale[Cn.indices]
     Cn_t = Cn.tocsr().T.tocsr()
 
-    val_users, val_chunks = split_by_user(val.uid.to_numpy(), val.item_id.to_numpy())
-    print(f"val   {len(val):,} 行 / {len(val_users):,} 个有目标的用户")
+    target_users, target_chunks = split_by_user(target.uid.to_numpy(), target.item_id.to_numpy())
+    print(f"{SPLIT:<5} {len(target):,} 行 / {len(target_users):,} 个有目标的用户")
 
-    print("\n[扫描] val 上的 hour 网格（官方验证指标 = ndcg@100，即命中率@100）")
-    scan = []
-    for hour in HOURS:
-        started = time.perf_counter()
-        w = hour_weights(pairs, hour)
+    if HOUR is None:
+        print("\n[扫描] val 上的 hour 网格（官方验证指标 = ndcg@100，即命中率@100）")
+        scan = []
+        for hour in HOURS:
+            started = time.perf_counter()
+            w = hour_weights(pairs, hour)
+            keep = w > ZERO_EPS  # 官方 eliminate_zeros
+            W = column_matrix(pairs.uid[keep], pairs.item[keep], w[keep], n_users, n_items)
+            A = user_user_matrix(C, W, n_users)
+            tops = top_k(A, Cn_t)
+            metrics, _ = evaluate(list(tops[target_users]), target_chunks, n_items)
+            scan.append((hour, metrics))
+            print(
+                f"  hour={hour:<6} 命中率@100={metrics['hitrate'][SELECT_K]:.6f}"
+                f"  recall@100={metrics['recall'][SELECT_K]:.6f}  ({time.perf_counter() - started:.1f}s)"
+            )
+
+        best_hour, best_metrics = max(scan, key=lambda x: x[1]["hitrate"][SELECT_K])
+        print(f"  → 最优 hour = {best_hour}（与官方一致：按命中率@100 选）")
+    else:
+        best_hour = HOUR
+        print(f"\n[跳过扫描] hour={best_hour}（val 上选出的档，不在 {SPLIT} 上选参）")
+        w = hour_weights(pairs, best_hour)
         keep = w > ZERO_EPS  # 官方 eliminate_zeros
         W = column_matrix(pairs.uid[keep], pairs.item[keep], w[keep], n_users, n_items)
-        A = user_user_matrix(C, W, n_users)
-        tops = top_k(A, Cn_t)
-        metrics, _ = evaluate(list(tops[val_users]), val_chunks, n_items)
-        scan.append((hour, metrics))
-        print(
-            f"  hour={hour:<6} 命中率@100={metrics['hitrate'][SELECT_K]:.6f}"
-            f"  recall@100={metrics['recall'][SELECT_K]:.6f}  ({time.perf_counter() - started:.1f}s)"
-        )
+        tops = top_k(user_user_matrix(C, W, n_users), Cn_t)
+        best_metrics, _ = evaluate(list(tops[target_users]), target_chunks, n_items)
 
-    best_hour, best_metrics = max(scan, key=lambda x: x[1]["hitrate"][SELECT_K])
-    print(f"  → 最优 hour = {best_hour}（与官方一致：按命中率@100 选）")
-    show("[val] 官方口径（不过滤已交互物品、目标保留不可排名行）", best_metrics, len(val_users), n_items)
+    show(f"[{SPLIT}] 官方口径（不过滤已交互物品、目标保留不可排名行）", best_metrics, len(target_users), n_items)
 
 
 if __name__ == "__main__":

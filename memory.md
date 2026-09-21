@@ -19,6 +19,7 @@
 8. 评测抽公共模块 → `scripts/rec_eval.py`（`04_popularity.py` 改用后重跑，val 数字一字未变）
 9. itemknn 基线：官方 13 档 hour 网格跑满，最优 hour=0.5 → `scripts/05_itemknn.py`、`docs/baselines.md`
 10. sasrec 基线：自己实现（torch 2.14.0），50 epoch / 329.8 秒，前向与官方 checkpoint 逐位一致 → `scripts/06_sasrec.py`、`docs/baselines.md`
+11. val / test 两个窗口的指标跑齐：三个脚本加 `split` 参数（`04/05` 还可再带一个 hour），test 上用 val 选出的档、不重跑网格，sasrec 复用 val 的 checkpoint → `README.md`、`docs/baselines.md`
 
 **待办**
 
@@ -49,6 +50,15 @@
 | sasrec 的 padding 用 id 627,648、排序时排除 | 官方的 0 在我们的 id 空间里是真实物品；排除后候选池 627,648，三个基线可比 |
 | sasrec 的位置编号固定按左填充到 200 | 官方随 batch 内最大长度平移（eval 还 `shuffle=True`）→ 同一用户换 batch 结果会变；满长度时我们与官方逐位一致 |
 | 训练型模型的验证用"导官方权重喂同一批输入比前向" | 训练有随机性（初始化/负采样/shuffle），逐位对不了；但模型定义这一层可以钉死（实测差 0） |
+| 评测跑 val + test 两个窗口，超参只在 val 上选 | test 只用来报告；在 test 上扫网格等于拿评测集选参。三个基线的 top-100 只由训练集决定（与评测窗口无关），所以换 split 只换评测目标 |
+| sasrec 在 test 上不重训、复用同一份 checkpoint | 重训会引入新的随机性，两列就不是同一个模型了；复用后 test 跑一次只要 30 秒 |
+
+## 本轮（2026-09-21）要点
+
+- 给三个基线脚本加 `split` 参数：`04_popularity.py [split] [hour]`、`05_itemknn.py [split] [hour]`、`06_sasrec.py [split]`；不给参数就是原来的 val 行为。
+- test 指标（第一遍切分的 test 窗口，4,599 个有目标的用户，候选池 627,648），recall@100 / 命中率@100：popularity 0.046988 / 0.388128（hour=1.0）、sasrec 0.070262 / 0.536638、itemknn 0.098117 / 0.579691（hour=0.5）。
+- 两个窗口上**序完全一致**（itemknn > sasrec > popularity）；val → test 略降（recall@100：popularity −1.5%、itemknn −5.1%、sasrec −5.8%），test 是更靠后的窗口、模型只用 train 训练。
+- 回归：改了脚本后重跑 val（04、05 带 hour）数字与原先一字未变；06 的 val 分支没有重跑（重跑会重训并覆盖 checkpoint，把 val 列和已跑的 test 列错开）。
 
 ## 本轮（2026-09-20）要点
 

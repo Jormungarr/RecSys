@@ -1,7 +1,8 @@
 """popularity 基线：自己实现一份，评测口径对齐官方 benchmark。
 
 运行：
-    uv run python scripts/04_popularity.py
+    uv run python scripts/04_popularity.py              # 在 val 上扫 hour 网格并评测
+    uv run python scripts/04_popularity.py test 1.0     # 在 test 上评测，hour 直接用 val 选出的 1.0
 
 口径出处（vendor/yambda-benchmarks/benchmarks/）：
 - 打分（models/popularity/main.py::training）：
@@ -11,10 +12,14 @@
       定义与出处见该文件 docstring
 - 超参：官方在 val 上扫 hour 网格（默认 7 档），按 val ndcg@100（即命中率@100）选最优
 
-注意：本脚本在 val 上评测（第一遍切分：train 截止 25,823,600，候选池 627,648）。
-官方最终 test 数字用的是第二遍训练集（val_size=0，train 延伸到 test 前 30 分钟），本仓库还没产出。
+注意：第一遍切分的两个 future 窗口：val 用来选 hour，test 用来报告（候选池 627,648）。
+排序只由训练集决定（score 只用到 train 的 timestamp），所以换 split 只换评测目标，top-100 不变。
+第二个参数是 hour：给了就跳过网格扫描。在 test 上评测时必须传 val 上选出的那一档，
+否则等于在 test 上选参。
+官方表格里的 test 数字用的是第二遍训练集（val_size=0，train 延伸到 test 前 30 分钟），与本仓库切分不同，不能直接比。
 """
 
+import sys
 from pathlib import Path
 
 import numpy as np
@@ -28,6 +33,8 @@ SPLITS = ROOT / "artifacts" / "splits"
 DAY = 86_400
 HOURS = (0.5, 1.0, 2.0, 3.0, 6.0, 12.0, 24.0)  # 官方 popularity 的网格
 SELECT_K = 100  # 官方 --validation_metric 默认 ndcg@100
+SPLIT = sys.argv[1] if len(sys.argv) > 1 else "val"  # 评测目标：val 或 test
+HOUR = float(sys.argv[2]) if len(sys.argv) > 2 else None  # 给了就跳过网格扫描
 
 
 def load(name: str) -> pd.DataFrame:
@@ -49,7 +56,7 @@ def rank_all(scores: np.ndarray) -> np.ndarray:
 
 def main() -> None:
     train = load("train")
-    val = load("val")
+    target = load(SPLIT)
 
     n_items = int(train.item_id.max()) + 1
     n_users = int(train.uid.max()) + 1
@@ -59,21 +66,30 @@ def main() -> None:
     train_ts = train.timestamp.to_numpy()
     print(f"train {len(train):,} 行 / {n_users:,} 用户 / {n_items:,} 候选物品；train max_ts = {max_ts:,}")
 
-    val_users, val_chunks = split_by_user(val.uid.to_numpy(), val.item_id.to_numpy())
-    n_unmappable = sum(int((chunk < 0).sum()) for chunk in val_chunks)
-    print(f"val   {len(val):,} 行 / {len(val_users):,} 个有目标的用户（其中不可排名的 -1 共 {n_unmappable:,} 行）")
+    target_users, target_chunks = split_by_user(target.uid.to_numpy(), target.item_id.to_numpy())
+    n_unmappable = sum(int((chunk < 0).sum()) for chunk in target_chunks)
+    print(
+        f"{SPLIT:<5} {len(target):,} 行 / {len(target_users):,} 个有目标的用户"
+        f"（其中不可排名的 -1 共 {n_unmappable:,} 行）"
+    )
 
-    print("\n[扫描] val 上的 hour 网格（官方验证指标 = ndcg@100，即命中率@100）")
-    scan = []
-    for hour in HOURS:
-        order = rank_all(item_scores(train_item, train_ts, max_ts, n_items, hour))
-        metrics, _ = evaluate([order[:SELECT_K]] * len(val_chunks), val_chunks, n_items)
-        scan.append((hour, metrics))
-        print(f"  hour={hour:<5} 命中率@100={metrics['hitrate'][SELECT_K]:.6f}  recall@100={metrics['recall'][SELECT_K]:.6f}")
-    best_hour, best_metrics = max(scan, key=lambda x: x[1]["hitrate"][SELECT_K])
-    print(f"  → 最优 hour = {best_hour}（与官方一致：按命中率@100 选）")
+    if HOUR is None:
+        print("\n[扫描] val 上的 hour 网格（官方验证指标 = ndcg@100，即命中率@100）")
+        scan = []
+        for hour in HOURS:
+            order = rank_all(item_scores(train_item, train_ts, max_ts, n_items, hour))
+            metrics, _ = evaluate([order[:SELECT_K]] * len(target_chunks), target_chunks, n_items)
+            scan.append((hour, metrics))
+            print(f"  hour={hour:<5} 命中率@100={metrics['hitrate'][SELECT_K]:.6f}  recall@100={metrics['recall'][SELECT_K]:.6f}")
+        best_hour, best_metrics = max(scan, key=lambda x: x[1]["hitrate"][SELECT_K])
+        print(f"  → 最优 hour = {best_hour}（与官方一致：按命中率@100 选）")
+    else:
+        best_hour = HOUR
+        order = rank_all(item_scores(train_item, train_ts, max_ts, n_items, best_hour))
+        best_metrics, _ = evaluate([order[:SELECT_K]] * len(target_chunks), target_chunks, n_items)
+        print(f"\n[跳过扫描] hour={best_hour}（val 上选出的档，不在 {SPLIT} 上选参）")
 
-    show("[val] 官方口径（不过滤已交互物品、目标保留不可排名行）", best_metrics, len(val_users), n_items)
+    show(f"[{SPLIT}] 官方口径（不过滤已交互物品、目标保留不可排名行）", best_metrics, len(target_users), n_items)
 
     # 对照 1：过滤掉用户训练期已交互的物品（候选与目标都过滤；官方不做这件事）
     order = rank_all(item_scores(train_item, train_ts, max_ts, n_items, best_hour))
@@ -82,7 +98,7 @@ def main() -> None:
     history = [np.unique(chunk) for chunk in split_by_user(train_uid, train_item)[1]]
 
     filtered_tops, filtered_chunks = [], []
-    for uid_value, chunk in zip(val_users, val_chunks):
+    for uid_value, chunk in zip(target_users, target_chunks):
         seen = history[uid_value]
         blocked = np.sort(position[seen])
         free = np.setdiff1d(np.arange(SELECT_K + blocked.size), blocked, assume_unique=True)
@@ -91,12 +107,12 @@ def main() -> None:
         position_in_history = np.searchsorted(seen, rankable)
         filtered_chunks.append(rankable[seen[np.clip(position_in_history, 0, seen.size - 1)] != rankable])
     metrics_filtered, n_filtered = evaluate(filtered_tops, filtered_chunks, n_items)
-    show("[val] 对照：过滤已交互物品（候选+目标都去掉历史）", metrics_filtered, n_filtered, n_items)
+    show(f"[{SPLIT}] 对照：过滤已交互物品（候选+目标都去掉历史）", metrics_filtered, n_filtered, n_items)
 
     # 对照 2：只看可排名的目标（把 -1 行从目标里丢掉）
-    rankable_chunks = [chunk[chunk >= 0] for chunk in val_chunks]
+    rankable_chunks = [chunk[chunk >= 0] for chunk in target_chunks]
     metrics_rankable, n_rankable = evaluate([order[:SELECT_K]] * len(rankable_chunks), rankable_chunks, n_items)
-    show("[val] 对照：只看可排名目标（丢掉 -1 行）", metrics_rankable, n_rankable, n_items)
+    show(f"[{SPLIT}] 对照：只看可排名目标（丢掉 -1 行）", metrics_rankable, n_rankable, n_items)
 
 
 if __name__ == "__main__":

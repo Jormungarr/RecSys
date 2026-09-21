@@ -2,6 +2,9 @@
 data/
 artifacts/
 
+# 个人学习不进 git
+.kun-design/
+
 # 官方 benchmark 代码（上游 yandex/yambda，Apache-2.0；克隆方式与上游版本见 docs/benchmark_repro.md）
 /vendor/
 
