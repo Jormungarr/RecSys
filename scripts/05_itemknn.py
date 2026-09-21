@@ -1,8 +1,9 @@
 """itemknn 基线：自己实现一份，评测口径对齐官方 benchmark。
 
 运行：
-    uv run python scripts/05_itemknn.py                # 在 val 上扫 13 档 hour 网格并评测（约 16 分钟）
-    uv run python scripts/05_itemknn.py test 0.5       # 在 test 上评测，hour 直接用 val 选出的 0.5（约 1.5 分钟）
+    uv run python scripts/05_itemknn.py                  # 在 val 上扫 13 档 hour 网格并评测（约 16 分钟）
+    uv run python scripts/05_itemknn.py test 0.5         # 在 test 上评测，hour 直接用 val 选出的 0.5（约 1.5 分钟）
+    uv run python scripts/05_itemknn.py test 0.5 b       # 版本 B 口径（官方表口径）：无 val，候选池 629,298
 
 口径出处（vendor/yambda-benchmarks/benchmarks/models/itemknn/main.py）：
 - C = 训练集「用户×物品」计数矩阵：同一 (uid, item) 的多次交互相加
@@ -23,11 +24,12 @@
 一到两个数量级，而外积走 BLAS。外积覆盖 W 的行集 × C 的**整列**（两者支撑不同：C(v, i) 与
 W(u, i) 不必同时非零），大物品按块组合、避免整列外积撑爆内存。
 
-注意：第一遍切分的两个 future 窗口：val 用来选 hour，test 用来报告（候选池 627,648）。
+注意：版本 A（默认）的两个 future 窗口：val 用来选 hour，test 用来报告（候选池 627,648）。
 排序只由训练集决定（C 与 W 都只从 train 算），所以换 split 只换评测目标，top-100 不变。
 第二个参数是 hour：给了就跳过 13 档网格扫描。在 test 上评测时必须传 val 上选出的那一档，
 否则等于在 test 上选参。
-官方表格里的 test 数字用的是第二遍训练集（val_size=0），与本仓库切分不同，不能直接比。
+官方表格里的 test 数字用的是第二遍训练集（val_size=0），默认口径 A 不能直接与它比；
+要并排比就加第三个参数 `b`（口径 B，见 architecture.md「实验流程与两套口径（A / B）」）。
 """
 
 import dataclasses
@@ -42,7 +44,9 @@ import scipy.sparse as sp
 from rec_eval import evaluate, show, split_by_user
 
 ROOT = Path(__file__).resolve().parents[1]
-SPLITS = ROOT / "artifacts" / "splits"
+SPLITS_ID = sys.argv[3] if len(sys.argv) > 3 else "a"  # 口径：a = 第一遍（有 val），b = 第二遍（val_size = 0）
+assert SPLITS_ID in ("a", "b"), f"口径只能是 a 或 b，收到 {SPLITS_ID!r}"
+SPLITS = ROOT / "artifacts" / ("splits" if SPLITS_ID == "a" else "splits_b")
 
 DAY = 86_400
 HOURS = (0.0, 0.001, 0.002, 0.004, 0.008, 0.016, 0.032, 0.064, 0.128, 0.256, 0.5, 1.0, 2.0)  # 官方 itemknn 的网格
@@ -51,6 +55,7 @@ ZERO_EPS = 1e-9  # 官方 eliminate_zeros 的阈值
 BLOCK = 512  # 外积分块的边长（要么两边都 ≤ BLOCK 直接算，要么按 BLOCK 切块两两组合）
 SPLIT = sys.argv[1] if len(sys.argv) > 1 else "val"  # 评测目标：val 或 test
 HOUR = float(sys.argv[2]) if len(sys.argv) > 2 else None  # 给了就跳过网格扫描
+assert not (SPLITS_ID == "b" and SPLIT != "test"), "版本 B 没有 val（val_size = 0），只能评测 test"
 
 
 @dataclasses.dataclass
@@ -155,7 +160,7 @@ def main() -> None:
 
     n_users = int(train.uid.max()) + 1
     n_items = int(train.item_id.max()) + 1
-    print(f"train {len(train):,} 行 / {n_users:,} 用户 / {n_items:,} 候选物品")
+    print(f"口径 {SPLITS_ID.upper()}；train {len(train):,} 行 / {n_users:,} 用户 / {n_items:,} 候选物品")
 
     pairs = build_pairs(train, n_users)
     print(f"(uid,item) 对        : {len(pairs.uid):,}")
@@ -171,6 +176,10 @@ def main() -> None:
     target_users, target_chunks = split_by_user(target.uid.to_numpy(), target.item_id.to_numpy())
     print(f"{SPLIT:<5} {len(target):,} 行 / {len(target_users):,} 个有目标的用户")
 
+    # 每用户训练期交互过的物品（uid 空间稠密，所以「按 uid 分组后的列表」下标就是 uid）
+    train_history = [np.unique(chunk) for chunk in split_by_user(train.uid.to_numpy(), train.item_id.to_numpy())[1]]
+    target_history = [train_history[u] for u in target_users]
+
     if HOUR is None:
         print("\n[扫描] val 上的 hour 网格（官方验证指标 = ndcg@100，即命中率@100）")
         scan = []
@@ -181,7 +190,9 @@ def main() -> None:
             W = column_matrix(pairs.uid[keep], pairs.item[keep], w[keep], n_users, n_items)
             A = user_user_matrix(C, W, n_users)
             tops = top_k(A, Cn_t)
-            metrics, _ = evaluate(list(tops[target_users]), target_chunks, n_items)
+            metrics, _ = evaluate(
+                list(tops[target_users]), target_chunks, n_items, all_tops=tops, history=target_history
+            )
             scan.append((hour, metrics))
             print(
                 f"  hour={hour:<6} 命中率@100={metrics['hitrate'][SELECT_K]:.6f}"
@@ -197,7 +208,9 @@ def main() -> None:
         keep = w > ZERO_EPS  # 官方 eliminate_zeros
         W = column_matrix(pairs.uid[keep], pairs.item[keep], w[keep], n_users, n_items)
         tops = top_k(user_user_matrix(C, W, n_users), Cn_t)
-        best_metrics, _ = evaluate(list(tops[target_users]), target_chunks, n_items)
+        best_metrics, _ = evaluate(
+            list(tops[target_users]), target_chunks, n_items, all_tops=tops, history=target_history
+        )
 
     show(f"[{SPLIT}] 官方口径（不过滤已交互物品、目标保留不可排名行）", best_metrics, len(target_users), n_items)
 

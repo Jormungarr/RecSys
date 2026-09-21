@@ -130,7 +130,8 @@ dcg（sasrec 的 eval.py 不上报 dcg）：
 
 - **NDCG 恒等于「命中率@k」**：`yambda/evaluation/metrics.py:167` 是 `ideal_dcg = calc_dcg(target_mask)`，算好的 `ideal_target_mask` 没被使用 → 真实 DCG 除以真实 DCG。所以表里的 `ndcg@k` 实际含义是「top-k 里至少命中一个 target 的用户占比」。
 - **recall 分母是 `min(num_positives, k)`**（`torch.clamp(num_positives, max=k)`），而同行注释写的是 `max(num_positives, k)`，注释与代码不一致。
-- **指标只统计有 target 的用户**（`cut_off_ranked`），分母是 4,599 而不是 9,208。
+- **指标只统计有 target 的用户**（`cut_off_ranked`），分母是 4,599 而不是 9,208；**例外是 coverage**——它按默认 `cut_off_ranked=False` 算（见下一条）。
+- **coverage@k 的用户集合在模型之间不一致**：`Coverage(cut_off_ranked=False)`（`metrics.py:185`）不裁到有目标的用户，`popularity` / `itemknn` 的 `Ranked` 就是训练集全部用户（`popularity/main.py:130` 的 `train.select("uid").unique()`）；但 `sasrec/eval.py:91` 把用户 inner join 到测试集，只剩有目标的用户。所以上表里 popularity / itemknn 的 `coverage@100` 与 sasrec 的那个**不是同一个口径**（外部复现时要么两条都算，要么说清用哪条）。
 - **两段式流程**：先用 `val_size=1 天` 的短训练集在 val 上选超参，再用 `val_size=0`（训练集向后延伸到 test 前 30 分钟）重训一次在 test 上报告。
 - **全量排序，不做已交互过滤**；候选池 = 训练期出现过的物品（sasrec 的口径是全部 Listen+ 物品 + padding 行 0，即 631,004 vs 其他模型的 629,298，差 0.27%）。
 - **sasrec 的训练脚本没有验证集、没有早停**，跑满 `num_epochs` 后存最后状态。
@@ -138,7 +139,7 @@ dcg（sasrec 的 eval.py 不上报 dcg）：
 ## 本机偏差与限制
 
 1. `bpr_als`、`sansa` 未跑（硬件限制，见表）。bpr_als 的折中方案是改用同库 `implicit.cpu`，属于改官方代码，需单独记录。
-2. `sasrec` 用 **50 epoch**（官方默认 100）。
+2. `sasrec` 用 **50 epoch**（官方默认 100）；**序列长度用 512**（官方默认 `--max_seq_len 200`）——这是唯一偏离官方默认模型的超参，动机与效果见 `docs/baselines.md`「序列长度 200 → 512」。
 3. `sasrec` **训练在 MPS、评测在 CPU**：`eval.py` 在 MPS 上会崩——`nn.TransformerEncoder` 推理路径调用了 MPS 未实现的 `aten::_nested_tensor_from_mask_left_aligned`（训练路径不触发）。
 4. `pin_memory_device="cuda"` 在 torch 2.14 只是 deprecation warning，会自动改用当前加速器，**无需改官方代码**。
 5. 所有模型显式传 `--device`；数据放 `data/raw/` 而非官方假定的 `data/`，用 `--data_dir` 指过去，不改代码。
