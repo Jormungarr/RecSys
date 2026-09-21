@@ -22,8 +22,8 @@
 - 训练样本（`data.py::TrainDataset`）：item = seq[:-1]、positive = seq[1:]（每个位置都预测下一首），
   负样本**每个位置随机 1 个**；损失 = BCEWithLogits([正分; 负分], [1; 0])
 - 超参（`train.py` 的默认值）：heads 2 / layers 2 / dropout 0.0 / lr 1e-3 / Adam / batch 256 / seed 42；
-  epoch 数官方默认 100，本机按 `docs/benchmark_repro.md` 记录的 50。**偏离官方默认的有两处**：
-  序列长度 512（官方 200，动机与效果见 `docs/baselines.md`）、embedding 维度 256（官方 64，扩容实验）——
+  epoch 数官方默认 100，本机按 `docs/benchmark_repro.md` 记录的 50。**偏离官方默认的有三处**：
+  序列长度 512（官方 200）、embedding 维度 128（官方 64）、层数 4（官方 2）——后面两处是容量包实验，
   也就是说本机现在这份 sasrec 已经不是“官方复现”配置，对表能力由口径 B + 文档记录保留。
 - 评测（`eval.py`）：用户向量 × 全部 item embedding 内积 → top-100，指标走 `scripts/rec_eval.py`
 - 设备：训练用 MPS，**推理必须用 CPU**（官方在 MPS 上跑 eval 会崩，见 `docs/benchmark_repro.md`）；
@@ -70,9 +70,9 @@ CHECKPOINT = ROOT / "artifacts" / "sasrec" / ("state.pt" if SPLITS_ID == "a" els
 
 MAX_SEQ_LEN = 512  # 官方默认 200；本机改 512 —— 训练集历史长度（去重物品）中位 666 / p90 2,239（docs/eda.md），
                    # 截到 200 时一半以上用户的历史被砍掉（实测：两个口径下序列长度中位都正好 = 200，即顶到上限）
-EMB = 64  # 官方默认 64（d256 扩容实验的结论见 docs/baselines.md；当前做时间特征，回 64 以便快迭代）
+EMB = 128  # 官方默认 64；本机做容量包实验（2026-09-21，与层数 2→4 一起改，见 docs/baselines.md）
 HEADS = 2
-LAYERS = 2
+LAYERS = 4  # 官方默认 2；与 EMB 一起构成容量包实验
 DROPOUT = 0.0
 LR = 1e-3
 BATCH = 256
