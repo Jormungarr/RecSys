@@ -5,6 +5,31 @@
 > 逐字对话不存仓库（Kun 的线程存档在 `~/.kun/data/threads/`），这里只留提炼后的要点。
 > 最后更新：2026-09-21。
 
+## 当前状态快照（交接用）
+
+**这一节是给下一个 agent 的入口**：只读这一节就能接着干；细节在下面各节与 `docs/baselines.md`。
+
+**当前最好组合**：sasrec，`MAX_SEQ_LEN=512` / `EMB=128` / `LAYERS=4`（其余：heads 2、dropout 0.0、lr 1e-3、Adam、batch 256、seed 42、50 epoch）；**两个时间特征开关都关**（`USE_TIME_FEATURE=False`、`USE_TIME_BIAS=False`，理由见「已完成」14）。权重就是 `artifacts/sasrec/state.pt`——**不改任何常量**跑 `uv run python scripts/06_sasrec.py test` 就是它。
+
+**当前数字**（口径 A，候选池 627,648，不过滤已交互物品）
+
+| | recall@100 | 命中率@100 | 回访 recall@100 | 新歌 recall@100 |
+|---|---|---|---|---|
+| val（4,627 用户） | **0.121823** | 0.685974 | **0.149584** | 0.049653 |
+| test（4,599 用户） | **0.110816** | 0.650359 | **0.139891** | 0.045000 |
+
+两条轴、两个窗口都是 sasrec 第一（对照：val itemknn 0.103341 / popularity 0.047727；test itemknn 0.098117 / popularity 0.046988）。**但新歌轴只是追平 popularity（test +0.4%），不是领先。**
+
+**这个“最好”的三个弱点（别过度声称）**
+
+1. `MAX_SEQ_LEN=512` 这一项证据最弱：200 → 512 的对照是在 NaN 缺陷下测的，修正后没重跑，现在只有方向性结论 + EDA 动机（历史长度中位 666、截到 200 时一半用户被砍）。
+2. **单 seed 42**：所有 sasrec 数字都没有噪声带，±几 % 的差异还不可判定。
+3. **口径 B 没跟上**：B 上的 sasrec 还是 d64 / 2 层（修正后 0.094515），“能对官方表”与“当前最好”目前是两个配置。
+
+**下一步建议顺序**（每步只改一处）：① 拆开 EMB / 层数，把容量包归因 → ② 排名融合重做（旧的已作废；顺带决定要不要固化成脚本）→ ③ dropout / 早停对照 → ④ 口径 B 的容量包。
+
+**读什么**：`architecture.md`（数据流与 A / B 口径）、`docs/baselines.md`（三个模型的数字、NaN 缺陷说明、两个新实验）、`docs/eda.md`（数据动机）、`docs/dataset_notes.md`（数据集事实与坑）；协作规则在 `AGENTS.md`。sasrec 一轮 50 epoch ≈ 45 分钟（MPS 训练 / CPU 推理；长时任务用 `bg-train` skill；自报时间不含机器 Idle Sleep）。
+
 ## 进度
 
 **已完成**
