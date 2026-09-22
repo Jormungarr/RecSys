@@ -43,6 +43,12 @@
   （只变“相对重要性”，不改有效 lr）。负样本权重恒为 1，行集合与批形状不变，**不加参数、不改架构**。
   **2026-09-22 试过一臂——弱正、val 上不可判定**：val recall@100 +0.41%（在噪声带内）、test +2.5%，
   收益集中在主动发现 / 新歌；默认仍是 `uniform`。数字与未试旋钮见 `docs/baselines.md`「正样本加权」。
+- **is_organic 事件特征（本机加的，`USE_ORGANIC`，默认关）**：把该条播放的 `is_organic`（0 = 推荐驱动、1 = 主动发现）
+  当**事件特征**：`Embedding(2, EMB)` 加到 token 表示上（与 Δ 时间特征同一位置），让模型知道“这次听的歌是推荐来的还是自己找的”。
+  **这是本机第一个会加参数的开关**（2 × EMB = **128 个参数**，d64 下）；推理时用的是**输入序列**的事件标记
+  （目标在未来，所以不泄未来）。checkpoint 里有无 `organic_embedding` 必须与开关一致，下有守卫。
+  **2026-09-22 试过一臂——小幅负结果**：主指标 val recall@100 −1.0% / test −1.5%，只换来新歌@10 **+17.4% / +14.2%**；
+  默认仍是关。数字与未试旋钮见 `docs/baselines.md`「is_organic 当事件特征」。
 - 超参（`train.py` 的默认值）：heads 2 / dropout 0.0 / lr 1e-3 / Adam / batch 256 / seed 42；
   epoch 数官方默认 100，本机按 `docs/benchmark_repro.md` 记录的 50。常量是**滚动**的：当前（emb 64 + 2 层）是
   2026-09-22 第二轮五臂对照用的快迭代配置；最强配置是 emb 128 + 4 层 + 序列 512（权重 `state_l512_d128_l4.pt`）。对表能力由口径 B + 文档记录保留。
@@ -110,6 +116,8 @@ POPULAR_K = 2000  # 「高流行」池 = 训练集频次 top-K（占候选池 0.
 WEIGHT_MODE = os.environ.get("WEIGHT_MODE", "uniform")  # 正样本权重：uniform = 都算 1（官方）；feedback = 参与度 × like 加成
 assert WEIGHT_MODE in ("uniform", "feedback"), f"WEIGHT_MODE 只能是 uniform 或 feedback，收到 {WEIGHT_MODE!r}"
 LIKE_BONUS = 2.0  # feedback 模式下，训练窗口内 (uid, item) 有过 like 的位置权重再乘这个倍数
+USE_ORGANIC = os.environ.get("USE_ORGANIC", "0") == "1"  # is_organic 当事件特征（Embedding(2, EMB)，+128 参数）；默认关
+               # 与 Δ 时间特征同一位置加到 token 表示上；checkpoint 里有无 organic_embedding 必须与它一致（下有守卫）
 LR = 1e-3
 BATCH = 256
 SEED = 42
@@ -177,6 +185,11 @@ def train_sequences(train: pd.DataFrame, n_users: int) -> list[np.ndarray]:
 def train_timestamps(train: pd.DataFrame, n_users: int) -> list[np.ndarray]:
     """每用户一条 timestamp 序列（与 train_sequences 同样的截断），供 Δ 与成对 Δt 两种时间特征用。"""
     return by_user(train, "timestamp", n_users)
+
+
+def train_organic(train: pd.DataFrame, n_users: int) -> list[np.ndarray]:
+    """每用户一条 is_organic 序列（同样截断）：事件特征（推荐驱动 / 主动发现），USE_ORGANIC 关闭时只是白加载一次。"""
+    return by_user(train, "is_organic", n_users)
 
 
 def group_items(frame: pd.DataFrame, n_users: int) -> list[np.ndarray]:
@@ -279,6 +292,15 @@ def delta_buckets(times: np.ndarray) -> np.ndarray:
     if times.size == 0:
         return np.zeros(0, dtype=np.int64)
     return np.digitize(times[-1] - times, TIME_BOUNDS).astype(np.int64)
+
+
+def pad_organic(organic: list[np.ndarray], users: np.ndarray) -> torch.Tensor:
+    """左填充到 MAX_SEQ_LEN 的 is_organic（int64，直接喂 Embedding）；填充位用 0（会被 mask 掉）。"""
+    out = np.zeros((len(users), MAX_SEQ_LEN), dtype=np.int64)
+    for row, uid in enumerate(users):
+        sequence = organic[uid][-MAX_SEQ_LEN:]
+        out[row, MAX_SEQ_LEN - len(sequence) :] = sequence
+    return torch.from_numpy(out)
 
 
 def pad_times(times: list[np.ndarray], users: np.ndarray) -> torch.Tensor:
@@ -448,6 +470,9 @@ class SASRec(nn.Module):
             self.time_embedding = nn.Embedding(N_TIME_BUCKETS, EMB)  # Δ 时间分桶（本机加的，官方没有）
         if USE_TIME_BIAS:
             self.time_bias = nn.Embedding(N_TIME_BUCKETS, HEADS)  # 相对时间偏置，按 head 分开（本机加的）
+        if USE_ORGANIC:
+            # is_organic 事件特征（本机加的，官方没有）：2 × EMB；与 Δ 时间特征同一位置加到 token 表示上
+            self.organic_embedding = nn.Embedding(2, EMB)
         self.layernorm = nn.LayerNorm(EMB, eps=1e-9)
         self.dropout = nn.Dropout(DROPOUT)
         self.encoder = Encoder()
@@ -476,7 +501,7 @@ class SASRec(nn.Module):
         if USE_DECAY:
             nn.init.zeros_(self.decay_lambda)  # 核 ≡ 0 起步，与基线逐位相同
 
-    def forward(self, item: torch.Tensor, times: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+    def forward(self, item: torch.Tensor, times: torch.Tensor, mask: torch.Tensor, organic: torch.Tensor | None = None) -> torch.Tensor:
         """item / times (B, 512) 已左填充 → (B, 512, EMB)。位置编号倒序：最新行为是 0。"""
         if POS_MODE == "index":
             positions = torch.arange(MAX_SEQ_LEN - 1, -1, -1, device=item.device)
@@ -499,6 +524,8 @@ class SASRec(nn.Module):
         embeddings = self.item_embedding(item) + position_part
         if USE_TIME_FEATURE:
             embeddings = embeddings + self.time_embedding(delta_buckets_tensor(times))
+        if USE_ORGANIC:
+            embeddings = embeddings + self.organic_embedding(organic)
         embeddings = self.dropout(self.layernorm(embeddings))
         # 加性浮点 mask：未来位与 padding 位填 -inf，等价于原先的（布尔因果掩码 + src_key_padding_mask）。
         # 建在 (B, heads, 512, 512) 上是为了后面能把相对时间偏置 in-place 加到同一块内存里，不必再要一份同尺寸张量。
@@ -542,6 +569,7 @@ class TrainDataset(Dataset):
         observed: list[np.ndarray] | None = None,
         popular: list[np.ndarray] | None = None,
         weights: list[np.ndarray] | None = None,
+        organic: list[np.ndarray] | None = None,
     ) -> None:
         keep = [(uid, seq, stamp) for uid, (seq, stamp) in enumerate(zip(sequences, times)) if len(seq) >= 2]
         self.users = [uid for uid, _, _ in keep]
@@ -551,6 +579,7 @@ class TrainDataset(Dataset):
         self.observed = observed
         self.popular = popular
         self.weights = weights  # 与 sequences 逐位对齐（见 build_weights）；None = 所有正样本算 1
+        self.organic = organic  # 与 sequences 逐位对齐的事件特征（is_organic）；USE_ORGANIC 关闭时模型会忽略它
 
     def __len__(self) -> int:
         return len(self.sequences)
@@ -584,17 +613,25 @@ class TrainDataset(Dataset):
             weight = self.weights[self.users[index]][1:].astype(np.float32)
         else:
             weight = np.ones(item.shape, np.float32)
-        return item, positive, negative, stamps, weight
+        # is_organic 事件特征：与 item 同一个位置（都是“当前这次播放”的属性）
+        if self.organic is not None:
+            organic = self.organic[self.users[index]][:-1].astype(np.int64)
+        else:
+            organic = np.zeros(item.shape, np.int64)
+        return item, positive, negative, stamps, weight, organic
 
 
-def collate(batch: list[tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]], pad_id: int):
+def collate(
+    batch: list[tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]], pad_id: int
+):
     item = np.full((len(batch), MAX_SEQ_LEN), pad_id, dtype=np.int64)
     positive = np.full_like(item, pad_id)
     negative = np.full_like(item, pad_id)
     times = np.zeros((len(batch), MAX_SEQ_LEN), dtype=np.int32)
     mask = np.zeros((len(batch), MAX_SEQ_LEN), dtype=bool)
     weight = np.ones((len(batch), MAX_SEQ_LEN), dtype=np.float32)  # 填充位置用 1.0；它们会被 mask 掉，不影响 loss
-    for row, (sample_item, sample_positive, sample_negative, sample_times, sample_weight) in enumerate(batch):
+    organic = np.zeros((len(batch), MAX_SEQ_LEN), dtype=np.int64)  # 填充位用 0，同样会被 mask 掉
+    for row, (sample_item, sample_positive, sample_negative, sample_times, sample_weight, sample_organic) in enumerate(batch):
         n = len(sample_item)
         item[row, MAX_SEQ_LEN - n :] = sample_item
         positive[row, MAX_SEQ_LEN - n :] = sample_positive
@@ -602,6 +639,7 @@ def collate(batch: list[tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np
         times[row, MAX_SEQ_LEN - n :] = sample_times
         mask[row, MAX_SEQ_LEN - n :] = True
         weight[row, MAX_SEQ_LEN - n :] = sample_weight
+        organic[row, MAX_SEQ_LEN - n :] = sample_organic
     return (
         torch.from_numpy(item),
         torch.from_numpy(positive),
@@ -609,6 +647,7 @@ def collate(batch: list[tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np
         torch.from_numpy(times),
         torch.from_numpy(mask),
         torch.from_numpy(weight),
+        torch.from_numpy(organic),
     )
 
 
@@ -620,8 +659,9 @@ def train(
     observed: list[np.ndarray] | None = None,
     popular: list[np.ndarray] | None = None,
     weights: list[np.ndarray] | None = None,
+    organic: list[np.ndarray] | None = None,
 ) -> SASRec:
-    dataset = TrainDataset(sequences, times, n_items, observed, popular, weights)
+    dataset = TrainDataset(sequences, times, n_items, observed, popular, weights, organic)
     print(f"训练样本（训练集里 ≥ 2 个物品的用户）: {len(dataset):,} / {len(sequences):,}")
     loader = DataLoader(
         dataset,
@@ -637,13 +677,13 @@ def train(
     for epoch in range(1, EPOCHS + 1):
         started = time.perf_counter()
         total = 0.0
-        for item, positive, negative, times, mask, weight in loader:
-            item, positive, negative, times, mask, weight = (
-                tensor.to(TRAIN_DEVICE) for tensor in (item, positive, negative, times, mask, weight)
+        for item, positive, negative, times, mask, weight, organic in loader:
+            item, positive, negative, times, mask, weight, organic = (
+                tensor.to(TRAIN_DEVICE) for tensor in (item, positive, negative, times, mask, weight, organic)
             )
             # bf16 自混精只包住训练步；enabled 里带设备判断，免得在没有 MPS 的机器上误开 CPU 的 bf16
             with torch.autocast(device_type=TRAIN_DEVICE, dtype=torch.bfloat16, enabled=USE_BF16 and TRAIN_DEVICE == "mps"):
-                query = model(item, times, mask)[mask]
+                query = model(item, times, mask, organic)[mask]
                 positive_scores = (query * model.item_embedding(positive[mask])).sum(dim=-1)
                 negative_scores = (query * model.item_embedding(negative[mask])).sum(dim=-1)
                 loss = torch.nn.functional.binary_cross_entropy_with_logits(
@@ -681,7 +721,7 @@ def main() -> None:
     torch.manual_seed(SEED)
     torch.set_float32_matmul_precision("high")
 
-    train_frame = load("train", ["uid", "item_id", "timestamp", "played_ratio_pct"])
+    train_frame = load("train", ["uid", "item_id", "timestamp", "played_ratio_pct", "is_organic"])
     target = load(EVAL_SPLIT, ["uid", "item_id", "is_organic", "played_ratio_pct"])
     n_users = int(train_frame.uid.max()) + 1
     n_items = int(train_frame.item_id.max()) + 1
@@ -693,10 +733,17 @@ def main() -> None:
 
     sequences = train_sequences(train_frame, n_users)
     times = train_timestamps(train_frame, n_users)
+    organic = train_organic(train_frame, n_users)  # is_organic 事件特征（USE_ORGANIC 关闭时模型不用它）
     assert all(len(sequence) for sequence in sequences), "每个 uid 都应有训练序列（否则 padding 掩码会全 True）"
     lengths = np.array([len(sequence) for sequence in sequences])
     delta_demo = delta_buckets(times[int(np.argmax(lengths))])
     print(f"序列长度: 中位 {int(np.median(lengths))} / 最大 {lengths.max()} / 截断到 {MAX_SEQ_LEN}")
+    if USE_ORGANIC:
+        share = float(np.mean([chunk.mean() for chunk in organic if chunk.size]))
+        print(
+            f"事件特征（USE_ORGANIC）: 主动发现（is_organic=1）在训练序列里占 {share:.2%}；"
+            f"Embedding(2, {EMB}) = {2 * EMB} 个参数"
+        )
     print(f"时间特征: {N_TIME_BUCKETS} 个对数桶，边界 {TIME_BOUNDS}；最长序列的 Δ 桶分布前 10 = {delta_demo[:10].tolist()}")
     if TRAIN_FIRST and POS_MODE != "index":
         # 开工前只看两件事（0 成本）：① 位置通道的档位占用（防「92.7% 挤一档」那种退化）；
@@ -746,7 +793,7 @@ def main() -> None:
         observed, popular = build_negatives(train_frame, n_users, n_items) if NEG_MODE == "hard" else (None, None)
         # 正样本权重：uniform（默认，官方）不需要；feedback 要一份与 sequences 对齐的权重（见 build_weights）
         weights = build_weights(train_frame, n_users, n_items) if WEIGHT_MODE == "feedback" else None
-        model = train(sequences, times, n_items, pad_id, observed, popular, weights)
+        model = train(sequences, times, n_items, pad_id, observed, popular, weights, organic)
         model.to(INFER_DEVICE)  # 先搬回 CPU 再存，免得 checkpoint 绑定 MPS
         CHECKPOINT.parent.mkdir(parents=True, exist_ok=True)
         # POS_MODE 与分位边界都写进 checkpoint：两种模式参数形状相同，形状守卫拦不住「装错了位置通道的权重」
@@ -790,6 +837,9 @@ def main() -> None:
         assert USE_TIME_BIAS == ("time_bias.weight" in state), (
             f"{CHECKPOINT.name} 的相对时间偏置与当前 USE_TIME_BIAS={USE_TIME_BIAS} 不一致：先重训或把开关改回来"
         )
+        assert USE_ORGANIC == ("organic_embedding.weight" in state), (
+            f"{CHECKPOINT.name} 的 is_organic 事件特征与当前 USE_ORGANIC={USE_ORGANIC} 不一致：先重训或把开关改回来"
+        )
         saved_layers = len({key.split(".")[2] for key in state if key.startswith("encoder.layers.")})
         assert saved_layers == LAYERS, (
             f"{CHECKPOINT.name} 是 {saved_layers} 层，而 LAYERS = {LAYERS}：换过层数后要先按当前配置重训一次"
@@ -824,6 +874,7 @@ def main() -> None:
     model.eval()
     item_tensor, mask = pad_sequences(sequences, np.arange(n_users), pad_id)
     times_tensor = pad_times(times, np.arange(n_users))
+    organic_tensor = pad_organic(organic, np.arange(n_users))
     user_vectors = np.empty((n_users, EMB), dtype=np.float32)
     with torch.no_grad():
         # 按用户分批：模型对每个用户独立，分批不改变结果，只是把 (B, heads, L, L) 的注意力矩阵压到能放下
@@ -833,6 +884,7 @@ def main() -> None:
                 item_tensor[start:stop].to(INFER_DEVICE),
                 times_tensor[start:stop].to(INFER_DEVICE),
                 mask[start:stop].to(INFER_DEVICE),
+                organic_tensor[start:stop].to(INFER_DEVICE),
             )
             # 左填充 → 最后一格就是最新行为
             user_vectors[start:stop] = embeddings[:, -1, :].float().cpu().numpy()
