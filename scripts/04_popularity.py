@@ -27,7 +27,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-from rec_eval import evaluate, history_flags, show, split_by_user, target_axes
+from rec_eval import evaluate, history_flags, item_frequency, show, split_by_user, target_axes
 
 ROOT = Path(__file__).resolve().parents[1]
 SPLITS_ID = sys.argv[3] if len(sys.argv) > 3 else "a"  # 口径：a = 第一遍（有 val），b = 第二遍（val_size = 0）
@@ -82,10 +82,12 @@ def main() -> None:
     train_history = [np.unique(chunk) for chunk in split_by_user(train_uid, train_item)[1]]
     target_history = [train_history[u] for u in target_users]
 
-    # 分层轴（is_organic / 参与度 / 回访×来源）：口径见 rec_eval.py 文件头，列来自 2026-09-22 补进 splits 的三个字段
+    # 分层轴（is_organic / 参与度 / 回访×来源 / 回访×稀疏度）：口径见 rec_eval.py 文件头，列来自 2026-09-22 补进 splits 的三个字段
     back = history_flags(target.uid.to_numpy(), target.item_id.to_numpy(), train_uid, train_item)
+    counts = np.bincount(train_item, minlength=n_items)  # 训练集物品频次（回访×稀疏度 轴用）
+    frequency = item_frequency(counts, target.item_id.to_numpy())
     axes = target_axes(
-        target.uid.to_numpy(), target.is_organic.to_numpy(), target.played_ratio_pct.to_numpy(), back
+        target.uid.to_numpy(), target.is_organic.to_numpy(), target.played_ratio_pct.to_numpy(), back, frequency
     )
 
     if HOUR is None:

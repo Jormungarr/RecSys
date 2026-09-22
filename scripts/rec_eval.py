@@ -22,7 +22,8 @@ chunks[i] 是同一用户的目标行（含重复、含 -1）；-1 = 训练集�
 - 官方 ndcg@k 是 real_dcg / real_dcg（已知 bug），实际含义 = 命中率@k；这里同时报正确 NDCG 和命中率
 - **分层轴**（`axes`，2026-09-22 加）：两个模型在“什么样的目标”上强弱不同，只看总平均分不出来。由 `target_axes`
   从 splits 的列生成三条轴——`is_organic`（推荐驱动 / 主动发现）、**参与度**（`played_ratio_pct`：部分听完 / 完整听完 / 回放）、
-  以及**回访×来源**（上面那条轴与回访/新歌高度混淆，必须交叉看）。分桶与回访/新歌同一套**逐用户**口径
+  以及**回访×来源**（上面那条轴与回访/新歌高度混淆，必须交叉看），还有**回访×稀疏度**（目标物品在训练集的交互数：≤5 / 6~100 / >100，
+  长尾桶是 2026-09-22 为“艺人/专辑 embedding 值不值得做”加的检查）。分桶与回访/新歌同一套**逐用户**口径
   （分母 min(桶内行数, k)，只在桶内有目标的用户上平均）。每行的回访标记用 `history_flags` 算。
 """
 
@@ -60,25 +61,44 @@ def finalize(bucket: dict) -> dict:
     }
 
 
+def item_frequency(counts: np.ndarray, item: np.ndarray) -> np.ndarray:
+    """每行目标的**训练集交互数**（物品不在训练集、即 -1 行记 0）。
+
+    counts 用 `np.bincount(train.item_id, minlength=n_items)` 算。
+    """
+    inside = np.clip(item, 0, counts.size - 1)  # -1 会绕到最后一项，所以下面用 item >= 0 盖掉
+    return np.where(item >= 0, counts[inside], 0)
+
+
+SPARSITY_NAMES = ("稀疏(≤5)", "中(6~100)", "热门(>100)")  # 与 item_frequency 配用
+
+
 def target_axes(
-    uid: np.ndarray, is_organic: np.ndarray, played_ratio: np.ndarray, back: np.ndarray
+    uid: np.ndarray, is_organic: np.ndarray, played_ratio: np.ndarray, back: np.ndarray, frequency: np.ndarray
 ) -> dict:
-    """从 splits 的列生成三条分层轴的桶码（口径见文件头），直接喂给 `evaluate(axes=...)`。
+    """从 splits 的列生成四条分层轴的桶码（口径见文件头），直接喂给 `evaluate(axes=...)`。
 
     is_organic：0 = 推荐驱动、1 = 主动发现（见 `docs/dataset_notes.md`）。
     参与度：<100 = 部分听完（Listen+ 的门槛是 ≥50，所以桶底是 50）、=100 = 完整听完、>100 = 回放（回放/拖动造成）。
     回访×来源：**必须带这条**——`is_organic` 与回访/新歌高度混淆（可排名目标里主动发现 80.9% 是回访，推荐驱动只有 56.1%），
     只报 is_organic 会把“回访比例差异”误读成“模型在两类目标上的差异”。
+    回访×稀疏度：目标物品在**训练集**的交互数（`frequency`，`item_frequency` 算）——用来看“新歌轴的难点是不是长尾”。
     """
     organic_codes = np.where(is_organic == 0, 1, 0)
     ratio_codes = np.where(played_ratio < 100, 0, np.where(played_ratio == 100, 1, 2))
     joint_codes = np.where(back, 0, 2) + organic_codes
+    sparsity_codes = np.where(frequency <= 5, 0, np.where(frequency <= 100, 1, 2))
+    sparse_joint = np.where(back, 0, 3) + sparsity_codes
     return {
         "is_organic": (["主动发现", "推荐驱动"], split_by_user(uid, organic_codes)[1]),
         "参与度": (["部分听完", "完整听完", "回放"], split_by_user(uid, ratio_codes)[1]),
         "回访×来源": (
             ["回访·主动发现", "回访·推荐驱动", "新歌·主动发现", "新歌·推荐驱动"],
             split_by_user(uid, joint_codes)[1],
+        ),
+        "回访×稀疏度": (
+            ["回访·" + name for name in SPARSITY_NAMES] + ["新歌·" + name for name in SPARSITY_NAMES],
+            split_by_user(uid, sparse_joint)[1],
         ),
     }
 
