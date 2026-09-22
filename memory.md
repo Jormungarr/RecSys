@@ -253,7 +253,7 @@
 - `scripts/05_itemknn.py`、`scripts/rec_eval.py`：只出终端数字，不落产物（itemknn 一档约 1 分 20 秒，13 档约 16 分钟）。
 - `artifacts/sasrec/`（gitignore）：`state.pt` = **最近一次训练**（每次训练都被覆写；2026-09-22 阶段 3 收尾时是 **难负样本那一臂的基线** `state_d64_neg_uniform.pt`）——它不是“当前最好”，别照着它报数；当前最好配置（seq 512 / emb 128 / 4 层，val recall@100 0.121823 / test 0.110816）的权重在 `state_l512_d128_l4.pt`。其余保留：`state_l512_d64.pt`（档案 0.100252 的来源，跨 session 诊断靠它）、`state_b.pt`（口径 B / d64/512/2 层）、`state_l512_d64_delta.pt`、`state_l512_d64_timebias.pt`、`state_l512_d64_idx.pt` / `state_l512_d64_pos_time.pt`，09-22 第二轮五臂的 `state_d64_{idx,tmlp,tt2v,tt2v_fix,tinterp,decay}.pt`，以及阶段 3 第一臂的 `state_d64_neg_uniform.pt` / `state_d64_neg_hard.pt`。换序列长度、维度、层数、Δ 开关、相对时间偏置开关、`POS_MODE` 或 `USE_DECAY` 都会让旧 checkpoint 装不回去（**7 处守卫**，给可读提示）；`NEG_MODE` 只改训练、不改推理，所以没有守卫、两臂的权重可以互相换。
 - `vendor/yambda-benchmarks/`（gitignore）：上游 clone，含自己那套 `.venv`。
-- 仓库现在有 **11 个 commit**：前 8 个属于 2026-09-21 之前那一轮（初始化 / val+test 双窗口 / 口径 B / 自写注意力 block + NaN 修复 / 相对时间偏置 / 容量包 / 归档 / 交接存档）；2026-09-22 新增 3 个——`50587b3` 文档与现状对齐、`a0bc75d` 阶段 1 数据层、以及**阶段 2（评测分层轴）+ 阶段 3 第一臂（难负样本）合在一个 commit 里**（两批改动落在同一批文件上，拆不开）。
+- 仓库现在有 **12 个 commit**：前 8 个属于 2026-09-21 之前那一轮（初始化 / val+test 双窗口 / 口径 B / 自写注意力 block + NaN 修复 / 相对时间偏置 / 容量包 / 归档 / 交接存档）；2026-09-22 新增 4 个，每步一个——`50587b3` 文档与现状对齐、`a0bc75d` 阶段 1 数据层、`36ec316` 阶段 2 评测分层轴、`f08dfbf` 阶段 3 第一臂（难负样本）。
 
 ## 杂项
 
