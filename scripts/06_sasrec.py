@@ -30,6 +30,14 @@
   四种形态都是“用时间替换位置”，开工前会打印**每用户可区分的位置比例**（index 1.00 / 连续 0.96 / 分位档 0.11）。
 - 训练样本（`data.py::TrainDataset`）：item = seq[:-1]、positive = seq[1:]（每个位置都预测下一首），
   负样本**每个位置随机 1 个**；损失 = BCEWithLogits([正分; 负分], [1; 0])
+- **难负样本（本机加的，`NEG_MODE`，默认 `uniform`）**：官方口径是每个位置**均匀随机 1 个**负样本（好抽但太容易，
+  候选池 62.7 万里绝大多数是模型一眼就能压过的）。`hard` 模式把 `HARD_SHARE` 比例的位置换成难负样本：其中一半取自该用户
+  **观测到的负反馈**（`weak_negative` 的 Listen− ∪ 训练窗口内的 dislike），一半取自**高流行且未交互**的物品
+  （训练集频次 top-`POPULAR_K`，去掉该用户完整训练期历史）；某一类为空就退回均匀随机，难负样本撞上正样本也退回。
+  **不加参数、不改架构**，所以不影响推理、也没有 checkpoint 守卫。
+  **2026-09-22 试过一臂（HARD_SHARE=0.5）——负结果**：recall@10 +13~17% 好，但 recall@100 **−14~17%**、
+  命中率@100 **−15~19%**（两个窗口一致，远超同 session 噪声带）→ 落在这套口径的主指标上不合算，默认仍是 `uniform`；
+  数字、机制推断与没试过的旋钮见 `docs/baselines.md`「难负样本」。
 - 超参（`train.py` 的默认值）：heads 2 / dropout 0.0 / lr 1e-3 / Adam / batch 256 / seed 42；
   epoch 数官方默认 100，本机按 `docs/benchmark_repro.md` 记录的 50。常量是**滚动**的：当前（emb 64 + 2 层）是
   2026-09-22 第二轮五臂对照用的快迭代配置；最强配置是 emb 128 + 4 层 + 序列 512（权重 `state_l512_d128_l4.pt`）。对表能力由口径 B + 文档记录保留。
@@ -90,6 +98,10 @@ USE_BF16 = False  # 训练步用 bf16 自混精。微基准：d128/4 层上单�
                   # 但 2026-09-22 在 d64/2 层上真跑：epoch 耗时与 fp32 相同（无收益），val recall@100 0.091862
                   # 落在三次同配置 fp32 重复（0.091091/0.091490/0.091868）的带内 → 无可辨认影响。
                   # 所以默认关；它在 d128/4 层上是否真能提速从未在真跑里验证过（要用得先单独验）
+NEG_MODE = os.environ.get("NEG_MODE", "uniform")  # 负样本口径：uniform = 官方（每位置均匀随机 1 个）；hard = 混合难负样本
+assert NEG_MODE in ("uniform", "hard"), f"NEG_MODE 只能是 uniform 或 hard，收到 {NEG_MODE!r}"
+HARD_SHARE = 0.5  # hard 模式下多少比例的位置用难负样本（其余位置仍是均匀随机），理由见 docs/baselines.md
+POPULAR_K = 2000  # 「高流行」池 = 训练集频次 top-K（占候选池 0.3%）
 LR = 1e-3
 BATCH = 256
 SEED = 42
@@ -157,6 +169,50 @@ def train_sequences(train: pd.DataFrame, n_users: int) -> list[np.ndarray]:
 def train_timestamps(train: pd.DataFrame, n_users: int) -> list[np.ndarray]:
     """每用户一条 timestamp 序列（与 train_sequences 同样的截断），供 Δ 与成对 Δt 两种时间特征用。"""
     return by_user(train, "timestamp", n_users)
+
+
+def group_items(frame: pd.DataFrame, n_users: int) -> list[np.ndarray]:
+    """按 uid 分组的物品 id（**不截断**——与 by_user 的区别就在这里，难负样本要用完整历史）。"""
+    users, chunks = split_by_user(frame.uid.to_numpy(), frame.item_id.to_numpy())
+    out: list[np.ndarray] = [np.empty(0, dtype=np.int64)] * n_users
+    for uid, chunk in zip(users, chunks):
+        out[uid] = chunk.astype(np.int64)
+    return out
+
+
+def build_negatives(train_frame: pd.DataFrame, n_users: int, n_items: int) -> tuple[list[np.ndarray], list[np.ndarray]]:
+    """难负样本池（每用户一份，只在 NEG_MODE="hard" 时建；不改任何口径，只是多准备两份物品集合）：
+
+    - 观测到的负反馈 = `weak_negative`（训练窗口内 `played_ratio_pct < 50`）∪ `feedback` 里**训练窗口内**的 dislike
+      （两张表已在阶段 1 落进本口径的 id 空间；dislike 用 timestamp ≤ 训练集最大时间戳截断，不碰未来窗口；
+      uid / 物品为 -1 的行丢掉——它们是本口径 id 空间外的东西）
+    - 高流行未交互 = 训练集频次 top-POPULAR_K 减去该用户**完整**训练期历史
+    """
+    weak = load("weak_negative", ["uid", "item_id"])
+    feedback = load("feedback", ["uid", "item_id", "timestamp", "event_type"])
+    limit = int(train_frame.timestamp.max())
+    dislike = feedback[
+        (feedback.event_type == "dislike")
+        & (feedback.timestamp <= limit)
+        & (feedback.uid >= 0)
+        & (feedback.item_id >= 0)
+    ]
+    weak_by_user = group_items(weak, n_users)
+    dislike_by_user = group_items(dislike, n_users)
+    observed = [np.union1d(weak_by_user[uid], dislike_by_user[uid]) for uid in range(n_users)]
+
+    counts = np.bincount(train_frame.item_id.to_numpy(), minlength=n_items)
+    top = np.argsort(-counts, kind="stable")[:POPULAR_K]
+    history = group_items(train_frame, n_users)
+    popular = [np.setdiff1d(top, np.unique(history[uid])) for uid in range(n_users)]
+
+    sizes = np.array([pool.size for pool in observed])
+    print(
+        f"难负样本（NEG_MODE=hard，HARD_SHARE={HARD_SHARE}）：观测到的负反馈 {int(sizes.sum()):,} 个物品 / "
+        f"覆盖 {int((sizes > 0).sum()):,} / {n_users:,} 用户（每用户中位 {int(np.median(sizes)):,} 个，最大 {int(sizes.max()):,}）；"
+        f"高流行池 top-{POPULAR_K}（训练集频次），去掉该用户历史后为空的有 {sum(pool.size == 0 for pool in popular):,} 个用户"
+    )
+    return observed, popular
 
 
 def pad_sequences(sequences: list[np.ndarray], users: np.ndarray, pad_id: int) -> tuple[torch.Tensor, torch.Tensor]:
@@ -427,22 +483,53 @@ class SASRec(nn.Module):
 
 
 class TrainDataset(Dataset):
-    """每个样本 = 一条序列的 (item, positive, negative, times)，四者在同一批位置上一一对应。"""
+    """每个样本 = 一条序列的 (item, positive, negative, times)，四者在同一批位置上一一对应。
 
-    def __init__(self, sequences: list[np.ndarray], times: list[np.ndarray], n_items: int) -> None:
-        keep = [(seq, stamp) for seq, stamp in zip(sequences, times) if len(seq) >= 2]  # 至少两个物品才有“下一首”
-        self.sequences = [seq for seq, _ in keep]
-        self.times = [stamp for _, stamp in keep]
+    NEG_MODE="hard" 时额外拿两份**按 uid 索引**的池（observed / popular）；注意 dataset 的 index 与 uid 不是一回事
+    （只留了 ≥ 2 个物品的用户），所以要把 uid 一并存下来。
+    """
+
+    def __init__(
+        self,
+        sequences: list[np.ndarray],
+        times: list[np.ndarray],
+        n_items: int,
+        observed: list[np.ndarray] | None = None,
+        popular: list[np.ndarray] | None = None,
+    ) -> None:
+        keep = [(uid, seq, stamp) for uid, (seq, stamp) in enumerate(zip(sequences, times)) if len(seq) >= 2]
+        self.users = [uid for uid, _, _ in keep]
+        self.sequences = [seq for _, seq, _ in keep]
+        self.times = [stamp for _, _, stamp in keep]
         self.n_items = n_items
+        self.observed = observed
+        self.popular = popular
 
     def __len__(self) -> int:
         return len(self.sequences)
+
+    def hard_negatives(self, uid: int, size: int) -> np.ndarray:
+        """难负样本：一半取自该用户观测到的负反馈，一半取自高流行未交互物品；某一类为空就退回均匀随机。"""
+        out = np.random.randint(0, self.n_items, size=size)
+        own = np.random.random(size) < 0.5
+        for pick, pool in ((own, self.observed[uid]), (~own, self.popular[uid])):
+            if pick.any() and pool.size:
+                out[pick] = pool[np.random.randint(0, pool.size, size=int(pick.sum()))]
+        return out
 
     def __getitem__(self, index: int) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
         sequence = self.sequences[index]
         item = sequence[:-1]
         positive = sequence[1:]
         negative = np.random.randint(0, self.n_items, size=item.shape)  # 官方 randint(1, num_items+1)
+        if self.observed is not None:
+            # 难负样本模式：只有这部分多抽随机数，uniform 模式的随机数消耗与改动前逐位相同
+            hard = np.random.random(item.shape) < HARD_SHARE
+            if hard.any():
+                negative[hard] = self.hard_negatives(self.users[index], int(hard.sum()))
+                clash = hard & (negative == positive)  # 难负样本撞上正样本：标签会自相矛盾，退回一个均匀随机样本
+                if clash.any():
+                    negative[clash] = np.random.randint(0, self.n_items, size=int(clash.sum()))
         # 原始时间戳（与 item 同一个位置对齐）：Δ 与成对 Δt 都在模型里现算
         stamps = self.times[index][:-1].astype(np.int32)
         return item, positive, negative, stamps
@@ -470,8 +557,15 @@ def collate(batch: list[tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]], 
     )
 
 
-def train(sequences: list[np.ndarray], times: list[np.ndarray], n_items: int, pad_id: int) -> SASRec:
-    dataset = TrainDataset(sequences, times, n_items)
+def train(
+    sequences: list[np.ndarray],
+    times: list[np.ndarray],
+    n_items: int,
+    pad_id: int,
+    observed: list[np.ndarray] | None = None,
+    popular: list[np.ndarray] | None = None,
+) -> SASRec:
+    dataset = TrainDataset(sequences, times, n_items, observed, popular)
     print(f"训练样本（训练集里 ≥ 2 个物品的用户）: {len(dataset):,} / {len(sequences):,}")
     loader = DataLoader(
         dataset,
@@ -590,7 +684,9 @@ def main() -> None:
         print("  " + "  ".join(f"{index}:{value:.1%}" for index, value in enumerate(share)))
 
     if TRAIN_FIRST:
-        model = train(sequences, times, n_items, pad_id)
+        # 负样本口径：uniform（默认，官方）不需要额外任何东西；hard 要多建两份按 uid 的物品池（见 build_negatives）
+        observed, popular = build_negatives(train_frame, n_users, n_items) if NEG_MODE == "hard" else (None, None)
+        model = train(sequences, times, n_items, pad_id, observed, popular)
         model.to(INFER_DEVICE)  # 先搬回 CPU 再存，免得 checkpoint 绑定 MPS
         CHECKPOINT.parent.mkdir(parents=True, exist_ok=True)
         # POS_MODE 与分位边界都写进 checkpoint：两种模式参数形状相同，形状守卫拦不住「装错了位置通道的权重」

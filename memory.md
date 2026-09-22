@@ -67,6 +67,15 @@
 26. **文档与现状对齐**（2026-09-22）：README 的 sasrec 跑法（常量滚动 / `state.pt` 每次训练被覆写 / 表里那行的权重在 `state_l512_d128_l4.pt`）与「当前状态」、`AGENTS.md` 的守卫数量（5 → **7**）、`architecture.md` 的 A 口径耗时、`docs/dataset_notes.md` 的三处数字（unlikes 推荐驱动 5.3%、13.1% 并列的**分母是模型输入的最后 512 条窗口**、复现命令改 `uv sync`）、`docs/baselines.md`「容量包」的权重所在，全部改到与仓库现状一致。核对方式是把 README 的 test 命令实跑一遍：`04`/`05` 与表逐项相同，`06` 被守卫拦下（`state.pt` 现在是 `POS_MODE=time_t2v` 那臂）。
 27. **阶段 1（数据层）落地：把没进管线的字段 / 文件囊括进来**（2026-09-22）：`scripts/02_build_splits.py` 给 splits 补三列（`is_organic` / `played_ratio_pct` / `track_length_seconds`，**正样本定义与行集合一字未变**、旧三列逐位校验相同），并另存四张表（同口径、同 id 空间、同 `-1` 约定）：`feedback.parquet`（四个反馈合并 + `event_type`，132.3 万行）、`weak_negative.parquet`（**训练窗口**内 `played_ratio_pct < 50`，A 1,650 万 / B 1,658 万行）、`item_artist.parquet`（A 62.5 万对 / 8.3 万艺人 / 覆盖 99.57% 物品）、`item_album.parquet`（A 102.9 万对 / 34.3 万专辑 / 覆盖 99.96%）；A、B 各一套。**回归**：`04`（val、test、口径 B）、`05`（test）、`06`（口径 B）数字逐项未变。附带发现：**Listen+ 里推荐驱动（`is_organic=0`）反而更多**（52.03%，全量 48.34%、Listen− 41.97%）。→ `docs/dataset_notes.md`、`architecture.md`
 28. **阶段 2（评测层）落地：三条分层轴**（2026-09-22）：`scripts/rec_eval.py` 加 `axes` 机制 + `target_axes`（目标来源 / 参与度 / 回访×来源）+ `history_flags`（每行目标是否回访，与两桶同一定义），`04/05/06` 主表都打印。**只动评测、不动模型**（sasrec 用 d64/2 的 `state_d64_idx.pt`）。三条结论：① “模型在主动发现这条轴上更差”**不成立**——三个模型都是主动发现 > 推荐驱动（1.44~2.14×）；② 但**必须带回访交叉**——主动发现里 **80.87% 是回访**、推荐驱动只有 56.06%，控制后差别几乎全落在回访里（1.37~1.95×），**新歌轴上 itemknn 两条来源几乎无差**（1.01×）；③ 参与度轴**没用**（84% 挤在“完整听完”、回放桶只有 1,073 行）→ `docs/baselines.md`「分层轴」、`architecture.md`。**回归**：三个基线的主表与回访/新歌数字逐项未变（累积器重构成 `new_bucket` / `accumulate` / `finalize`，`04`/`05`/`06` 都重跑过）。
+29. **阶段 3·第一臂：难负样本（`NEG_MODE`，不加参数不改架构）——负结果**（2026-09-22）：每个位置仍只抽 1 个负样本，但 `HARD_SHARE=0.5` 的位置换难：
+  ① 该用户**观测到的负反馈**（`weak_negative` ∪ 训练窗口内 dislike；7,042,955 个物品 / 覆盖 9,198 用户 / 每用户中位 477 个）；
+  ② **高流行未交互**（频次 top-2000 减完整历史）。实测难负样本平均频次 **2,214** vs 均匀 **45**；池只花 2.5 s 建一次；
+  撞正样本退回（不守则有 0.11% 位置会撞）。同一条命令背靠背：基线 902.9 s / hard 962.8 s。
+  **结果：`@100` 全线变差、`@10` 变好**——val recall@100 **0.091359 → 0.078416（−14.2%）**、命中率@100 −15.3%；
+  test **0.085805 → 0.071054（−17.2%）**、命中率@100 −18.9%；回访 −20.6% / −22.3%；
+  推荐驱动轴 −34.4% / −44.9%、回访·推荐驱动 −48.4% / −54.8%；但 recall@10 **+13.1% / +17.2%**、新歌@10 **+32.0% / +30.6%**。
+  默认回到 `uniform`，开关留着能复现。**顺带一条**：本次基线 val 0.091359 vs 上午五臂基线 0.091443 → 只差 **0.09%**，
+  今天这两次跨 session **没有**重现那个 9~11% 的漂移（机制仍未解释，规矩不撤销）→ `docs/baselines.md`「难负样本」
 
 **待办**
 
@@ -103,7 +112,9 @@
 - **把没进管线的字段/文件囊括进来（用户 2026-09-22 定：这次都囊括）** —— 盘点与实测统计见 `docs/dataset_notes.md`「未进管线的字段与文件」，分四阶段：
   - ~~**阶段 1（数据层，A/B 各 1~2 分钟，不训练、不破坏现有数字）**~~ **已完成（2026-09-22，见「已完成」27）**：`02_build_splits.py` 给 listens 的 splits 补三列（`is_organic` / `played_ratio_pct` / `track_length_seconds`，**正样本定义与行集合不变**）；另存 `feedback.parquet`（四个反馈合并 + event_type）、`weak_negative.parquet`（训练窗口内 `played_ratio_pct < 50`）、`item_artist.parquet` / `item_album.parquet`（只覆盖该口径训练集的物品）。
   - ~~**阶段 2（评测层，改 `rec_eval.py`，用现有 checkpoint 就能算）**~~ **已完成（2026-09-22，见「已完成」28）**：三条分层轴（目标来源 / 参与度 / 回访×来源），结论见 `docs/baselines.md`「分层轴」。
-  - **阶段 3（模型层，一次一臂）—— 下一步**：A 难负样本（dislikes + `weak_negative` 的 1,650 万行 + 高流行非交互）；B 正样本按 `played_ratio_pct` / likes 加权；C `is_organic` 当事件特征；D **艺人 / 专辑 embedding 与艺人流行度**（押注：这条最可能动新歌轴）。一律在 d64/2 原始架构上做。
+  - **阶段 3（模型层，一次一臂）—— 进行中**：~~A 难负样本~~ **已做完（2026-09-22，见「已完成」29）→ 负结果（@100 全线变差）**；
+    还没试的旋钮：`HARD_SHARE` 降到 0.1~0.2 / 只对部分用户用 / **只用观测到的负反馈不用高流行**（机制上最可能保住 @10 收益）。
+    剩下三臂：B 正样本按 `played_ratio_pct` / likes 加权；C `is_organic` 当事件特征；D **艺人 / 专辑 embedding 与艺人流行度**（押注：这条最可能动新歌轴）。一律在 d64/2 原始架构上做。
   - **阶段 4（可选、最重）**：下载 `embeddings.parquet`（13.8 GB）做内容特征。
   - 纪律：**评测目标定义不变**（val/test 仍 Listen+，否则整张历史表作废）；三个基线先都不动（新字段只让 sasrec 侧试），避免“模型换了、对照也换了”。
 - **index 粗化对照**（排除“粗化”这个混淆）：用户 2026-09-22 决定**不做**；代价是 time vs index 的归因永远分不清是“时间刻度”还是“粗化”，只能当组合结论。
@@ -166,6 +177,8 @@
 | 分层轴必须带**回访×来源**的交叉，不能只报 `is_organic` | 单轴与回访/新歌高度混淆（主动发现 80.87% 是回访、推荐驱动 56.06%）→ 会把“回访比例差异”误读成“来源差异”；交叉后主效应落在回访里（1.37~1.95×），新歌轴上 itemknn 两条来源无差（1.01×） |
 | 评测分层只加轴、不动模型（sasrec 固定 d64/2 / `POS_MODE=index`） | 用户 2026-09-22 定：保证与现有 baseline 直接可比；d128/4 那版没参与，序可能不同，要用得另跑 |
 | 参与度轴（`played_ratio_pct` 百分比）暂不作为判据 | 84~85% 的目标挤在“完整听完”一档、三档差 1~3%、回放桶 1,073 行 → 不可判；要用得先改分档（如实际收听秒数 = ratio × length 的分位） |
+| 难负样本默认关（`NEG_MODE=uniform`） | 试过 `HARD_SHARE=0.5` 一臂：@10 +13~17% 但 **@100 −14~19%**（两个窗口一致，远超噪声带）→ 主指标不合算。推断（未验证）：高流行负样本压的是共享物品空间的**热门方向**，而评测目标重度依赖热门 |
+| 难负样本撞上正样本必须退回 | 同一物品可能既是正样本又在负反馈池里（实测直抽会撞 0.11%）；不退回就是自相矛盾的标签 → 只多一次随机抽取 |
 | 模型侧实验一律在**原始架构 d64/2（输入只有 item + position）**上做 | 用户 2026-09-22 定：这样能直接与已有 baseline 对比；位置通道收尾 / 容量包归因 / dropout 早停 / 口径 B 容量包都不应先改架构 |
 | 显式反馈与“点开就划走”都是监督信号，不是丢弃物 | dislike = 明确负反馈（可当难负样本）；`played_ratio_pct < 50` 的 36.6% 是弱负反馈；现在只用了 Listen+ 阈值，其余全丢 |
 
@@ -238,9 +251,9 @@
 - `artifacts/splits_b/`（gitignore）：版本 B（`val_size=0`）的切分，`train.parquet` 244.6 MB + `test.parquet` + 两张映射表 + 同样的四张附加表；**没有 val**。
 - `artifacts/eda/`（gitignore）：6 张 PNG。
 - `scripts/05_itemknn.py`、`scripts/rec_eval.py`：只出终端数字，不落产物（itemknn 一档约 1 分 20 秒，13 档约 16 分钟）。
-- `artifacts/sasrec/`（gitignore）：`state.pt` = **最近一次训练**（每次训练都被覆写；2026-09-22 收尾时是 `POS_MODE=time_t2v` 那臂、d64/2 层）——它不是“当前最好”，别照着它报数；当前最好配置（seq 512 / emb 128 / 4 层，val recall@100 0.121823 / test 0.110816）的权重在 `state_l512_d128_l4.pt`。其余保留：`state_l512_d64.pt`（档案 0.100252 的来源，跨 session 诊断靠它）、`state_b.pt`（口径 B / d64/512/2 层）、`state_l512_d64_delta.pt`、`state_l512_d64_timebias.pt`、`state_l512_d64_idx.pt` / `state_l512_d64_pos_time.pt`，以及 09-22 第二轮五臂的 `state_d64_{idx,tmlp,tt2v,tt2v_fix,tinterp,decay}.pt`。换序列长度、维度、层数、Δ 开关、相对时间偏置开关、`POS_MODE` 或 `USE_DECAY` 都会让旧 checkpoint 装不回去（**7 处守卫**，给可读提示）。
+- `artifacts/sasrec/`（gitignore）：`state.pt` = **最近一次训练**（每次训练都被覆写；2026-09-22 阶段 3 收尾时是 **难负样本那一臂的基线** `state_d64_neg_uniform.pt`）——它不是“当前最好”，别照着它报数；当前最好配置（seq 512 / emb 128 / 4 层，val recall@100 0.121823 / test 0.110816）的权重在 `state_l512_d128_l4.pt`。其余保留：`state_l512_d64.pt`（档案 0.100252 的来源，跨 session 诊断靠它）、`state_b.pt`（口径 B / d64/512/2 层）、`state_l512_d64_delta.pt`、`state_l512_d64_timebias.pt`、`state_l512_d64_idx.pt` / `state_l512_d64_pos_time.pt`，09-22 第二轮五臂的 `state_d64_{idx,tmlp,tt2v,tt2v_fix,tinterp,decay}.pt`，以及阶段 3 第一臂的 `state_d64_neg_uniform.pt` / `state_d64_neg_hard.pt`。换序列长度、维度、层数、Δ 开关、相对时间偏置开关、`POS_MODE` 或 `USE_DECAY` 都会让旧 checkpoint 装不回去（**7 处守卫**，给可读提示）；`NEG_MODE` 只改训练、不改推理，所以没有守卫、两臂的权重可以互相换。
 - `vendor/yambda-benchmarks/`（gitignore）：上游 clone，含自己那套 `.venv`。
-- 仓库现在有 **8 个 commit**（`4063f27` 初始化 / `76bf298` val+test 双窗口 / `60084dc` 口径 B 那一批 + 修正过时的 git 状态描述 / `207e872` 自写注意力 block + NaN 修复 / `6d47d9c` 相对时间偏置 / `3fc582d` 容量包 / `ab77f7b` 归档（改正受 NaN 缺陷影响的数字）/ `7e887ed` 交接存档——后五个是 2026-09-21 那一轮里逐步提交的，每步一个 commit，便于回退）。**2026-09-22 的工作（提速三杠杆、`POS_MODE`、数据盘点、文档对齐）都还在工作区**（`memory.md` / `docs/baselines.md` / `docs/dataset_notes.md` / `scripts/06_sasrec.py` / `README.md` / `AGENTS.md` / `architecture.md`），尚未提交。
+- 仓库现在有 **11 个 commit**：前 8 个属于 2026-09-21 之前那一轮（初始化 / val+test 双窗口 / 口径 B / 自写注意力 block + NaN 修复 / 相对时间偏置 / 容量包 / 归档 / 交接存档）；2026-09-22 新增 3 个——`50587b3` 文档与现状对齐、`a0bc75d` 阶段 1 数据层、以及**阶段 2（评测分层轴）+ 阶段 3 第一臂（难负样本）合在一个 commit 里**（两批改动落在同一批文件上，拆不开）。
 
 ## 杂项
 
