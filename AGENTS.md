@@ -21,7 +21,7 @@
 | `docs/benchmark_repro.md` | 官方 benchmark 在本机的落地情况 + 官方基线数字 |
 | `docs/eda.md` | 切分后数据的分布 / 长尾 / 时间结构（图在 `artifacts/eda/`） |
 | `docs/baselines.md` | 各 baseline 的原理与数字 |
-| `scripts/` | `01` 看数据、`02` 切分、`03` EDA、`04` popularity、`05` itemknn、`06` sasrec；另有 `rec_eval.py`（评测库，各模型共用） |
+| `scripts/` | `01` 看数据、`02` 切分、`03` EDA、`04` popularity、`05` itemknn、`06` sasrec、`07` 分区检查（只读：长尾/冷物品/艺人共现）；另有 `rec_eval.py`（评测库，各模型共用） |
 
 ## 协作方式（重要）
 

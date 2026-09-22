@@ -85,7 +85,7 @@ scripts/06_sasrec.py（训练 → 序列末向量 × 物品表 → 评测）    
 
 | 路径 | 说明 |
 |---|---|
-| `scripts/NN_*.py` | 按序号的管线脚本（`01` 看数据 / `02` 切分 / `03` EDA / `04` popularity / `05` itemknn / `06` sasrec）；朴素 `print`，可反复重跑 |
+| `scripts/NN_*.py` | 按序号的管线脚本（`01` 看数据 / `02` 切分 / `03` EDA / `04` popularity / `05` itemknn / `06` sasrec / `07` 分区检查——只读：长尾 / 冷物品 / 艺人共现）；朴素 `print`，可反复重跑 |
 | `scripts/rec_eval.py` | 评测库（各模型共用）；不编序号，因为它不是可执行脚本 |
 | `docs/*.md` | 专题结论：`dataset_notes.md`、`benchmark_repro.md`、`eda.md`、`baselines.md` |
 | `AGENTS.md` | 只放 agent 相关：协作方式、工作要求、环境、约定、索引 |
