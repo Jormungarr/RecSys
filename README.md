@@ -58,7 +58,7 @@
 ## 目录
 
 ```
-scripts/   01 看数据 / 02 切分 / 03 EDA / 04 popularity / 05 itemknn / 06 sasrec
+scripts/   01 看数据 / 02 切分 / 03 EDA / 04 popularity / 05 itemknn / 06 sasrec / 07 分区检查（只读）
            rec_eval.py      评测库（三个模型共用）
 docs/      dataset_notes.md  数据集事实与已知坑
            benchmark_repro.md 官方 benchmark 在本机的落地与官方数字
