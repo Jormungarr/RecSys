@@ -38,6 +38,11 @@
   **2026-09-22 试过一臂（HARD_SHARE=0.5）——负结果**：recall@10 +13~17% 好，但 recall@100 **−14~17%**、
   命中率@100 **−15~19%**（两个窗口一致，远超同 session 噪声带）→ 落在这套口径的主指标上不合算，默认仍是 `uniform`；
   数字、机制推断与没试过的旋钮见 `docs/baselines.md`「难负样本」。
+- **正样本加权（本机加的，`WEIGHT_MODE`，默认 `uniform`）**：`feedback` 模式给每个**正样本**一个权重
+  `played_ratio_pct / 100`，训练窗口内 (uid, item) 有过 like 的再 ×`LIKE_BONUS`；最后把**全部训练位置**归一到均值 1
+  （只变“相对重要性”，不改有效 lr）。负样本权重恒为 1，行集合与批形状不变，**不加参数、不改架构**。
+  **2026-09-22 试过一臂——弱正、val 上不可判定**：val recall@100 +0.41%（在噪声带内）、test +2.5%，
+  收益集中在主动发现 / 新歌；默认仍是 `uniform`。数字与未试旋钮见 `docs/baselines.md`「正样本加权」。
 - 超参（`train.py` 的默认值）：heads 2 / dropout 0.0 / lr 1e-3 / Adam / batch 256 / seed 42；
   epoch 数官方默认 100，本机按 `docs/benchmark_repro.md` 记录的 50。常量是**滚动**的：当前（emb 64 + 2 层）是
   2026-09-22 第二轮五臂对照用的快迭代配置；最强配置是 emb 128 + 4 层 + 序列 512（权重 `state_l512_d128_l4.pt`）。对表能力由口径 B + 文档记录保留。
@@ -102,6 +107,9 @@ NEG_MODE = os.environ.get("NEG_MODE", "uniform")  # 负样本口径：uniform = 
 assert NEG_MODE in ("uniform", "hard"), f"NEG_MODE 只能是 uniform 或 hard，收到 {NEG_MODE!r}"
 HARD_SHARE = 0.5  # hard 模式下多少比例的位置用难负样本（其余位置仍是均匀随机），理由见 docs/baselines.md
 POPULAR_K = 2000  # 「高流行」池 = 训练集频次 top-K（占候选池 0.3%）
+WEIGHT_MODE = os.environ.get("WEIGHT_MODE", "uniform")  # 正样本权重：uniform = 都算 1（官方）；feedback = 参与度 × like 加成
+assert WEIGHT_MODE in ("uniform", "feedback"), f"WEIGHT_MODE 只能是 uniform 或 feedback，收到 {WEIGHT_MODE!r}"
+LIKE_BONUS = 2.0  # feedback 模式下，训练窗口内 (uid, item) 有过 like 的位置权重再乘这个倍数
 LR = 1e-3
 BATCH = 256
 SEED = 42
@@ -213,6 +221,43 @@ def build_negatives(train_frame: pd.DataFrame, n_users: int, n_items: int) -> tu
         f"高流行池 top-{POPULAR_K}（训练集频次），去掉该用户历史后为空的有 {sum(pool.size == 0 for pool in popular):,} 个用户"
     )
     return observed, popular
+
+
+def build_weights(train_frame: pd.DataFrame, n_users: int, n_items: int) -> list[np.ndarray]:
+    """正样本权重（只在 WEIGHT_MODE="feedback" 时建）：`played_ratio_pct / 100`，训练窗口内 (uid, item) 有过 like
+    的再 ×`LIKE_BONUS`；最后把**全部训练位置**归一到均值 1——对照里只变“相对重要性”，不改有效 lr。
+
+    与 `train_sequences` 用同一套截断（每用户最后 MAX_SEQ_LEN 条），所以下标与序列逐位对齐。
+    注意不能用 `by_user`：它会给 float 权重取 `.astype(np.int64)`。
+    """
+    weight = train_frame.played_ratio_pct.to_numpy().astype(np.float32) / 100.0
+    feedback = load("feedback", ["uid", "item_id", "timestamp", "event_type"])
+    limit = int(train_frame.timestamp.max())
+    likes = feedback[
+        (feedback.event_type == "like")
+        & (feedback.timestamp <= limit)
+        & (feedback.uid >= 0)
+        & (feedback.item_id >= 0)
+    ]
+    keys = np.sort(likes.uid.to_numpy().astype(np.int64) * n_items + likes.item_id.to_numpy())
+    positions = train_frame.uid.to_numpy().astype(np.int64) * n_items + train_frame.item_id.to_numpy()
+    liked = np.zeros(len(positions), dtype=bool)
+    if keys.size:  # 用 searchsorted 而不是 isin：2900 万个位置 × 70 万个 like 键
+        found = np.clip(np.searchsorted(keys, positions), 0, keys.size - 1)
+        liked = keys[found] == positions
+    weight = np.where(liked, weight * LIKE_BONUS, weight)
+    weight /= weight.mean()
+
+    users, chunks = split_by_user(train_frame.uid.to_numpy(), weight)
+    out: list[np.ndarray] = [np.empty(0, dtype=np.float32)] * n_users
+    for uid, chunk in zip(users, chunks):
+        out[uid] = chunk[-MAX_SEQ_LEN:].astype(np.float32)
+    print(
+        f"正样本权重（WEIGHT_MODE=feedback，LIKE_BONUS={LIKE_BONUS}）：ratio/100；"
+        f"带 like 加成的位置 {int(liked.sum()):,} / {len(weight):,}（{liked.mean():.2%}）；"
+        f"归一到均值 1 后 min {weight.min():.3f} / 中位 {np.median(weight):.3f} / max {weight.max():.3f}"
+    )
+    return out
 
 
 def pad_sequences(sequences: list[np.ndarray], users: np.ndarray, pad_id: int) -> tuple[torch.Tensor, torch.Tensor]:
@@ -496,6 +541,7 @@ class TrainDataset(Dataset):
         n_items: int,
         observed: list[np.ndarray] | None = None,
         popular: list[np.ndarray] | None = None,
+        weights: list[np.ndarray] | None = None,
     ) -> None:
         keep = [(uid, seq, stamp) for uid, (seq, stamp) in enumerate(zip(sequences, times)) if len(seq) >= 2]
         self.users = [uid for uid, _, _ in keep]
@@ -504,6 +550,7 @@ class TrainDataset(Dataset):
         self.n_items = n_items
         self.observed = observed
         self.popular = popular
+        self.weights = weights  # 与 sequences 逐位对齐（见 build_weights）；None = 所有正样本算 1
 
     def __len__(self) -> int:
         return len(self.sequences)
@@ -532,28 +579,36 @@ class TrainDataset(Dataset):
                     negative[clash] = np.random.randint(0, self.n_items, size=int(clash.sum()))
         # 原始时间戳（与 item 同一个位置对齐）：Δ 与成对 Δt 都在模型里现算
         stamps = self.times[index][:-1].astype(np.int32)
-        return item, positive, negative, stamps
+        # 正样本权重：与 positive 对齐（权重按 uid 索引，dataset 下标不等于 uid；取不到就全 1）
+        if self.weights is not None:
+            weight = self.weights[self.users[index]][1:].astype(np.float32)
+        else:
+            weight = np.ones(item.shape, np.float32)
+        return item, positive, negative, stamps, weight
 
 
-def collate(batch: list[tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]], pad_id: int):
+def collate(batch: list[tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]], pad_id: int):
     item = np.full((len(batch), MAX_SEQ_LEN), pad_id, dtype=np.int64)
     positive = np.full_like(item, pad_id)
     negative = np.full_like(item, pad_id)
     times = np.zeros((len(batch), MAX_SEQ_LEN), dtype=np.int32)
     mask = np.zeros((len(batch), MAX_SEQ_LEN), dtype=bool)
-    for row, (sample_item, sample_positive, sample_negative, sample_times) in enumerate(batch):
+    weight = np.ones((len(batch), MAX_SEQ_LEN), dtype=np.float32)  # 填充位置用 1.0；它们会被 mask 掉，不影响 loss
+    for row, (sample_item, sample_positive, sample_negative, sample_times, sample_weight) in enumerate(batch):
         n = len(sample_item)
         item[row, MAX_SEQ_LEN - n :] = sample_item
         positive[row, MAX_SEQ_LEN - n :] = sample_positive
         negative[row, MAX_SEQ_LEN - n :] = sample_negative
         times[row, MAX_SEQ_LEN - n :] = sample_times
         mask[row, MAX_SEQ_LEN - n :] = True
+        weight[row, MAX_SEQ_LEN - n :] = sample_weight
     return (
         torch.from_numpy(item),
         torch.from_numpy(positive),
         torch.from_numpy(negative),
         torch.from_numpy(times),
         torch.from_numpy(mask),
+        torch.from_numpy(weight),
     )
 
 
@@ -564,8 +619,9 @@ def train(
     pad_id: int,
     observed: list[np.ndarray] | None = None,
     popular: list[np.ndarray] | None = None,
+    weights: list[np.ndarray] | None = None,
 ) -> SASRec:
-    dataset = TrainDataset(sequences, times, n_items, observed, popular)
+    dataset = TrainDataset(sequences, times, n_items, observed, popular, weights)
     print(f"训练样本（训练集里 ≥ 2 个物品的用户）: {len(dataset):,} / {len(sequences):,}")
     loader = DataLoader(
         dataset,
@@ -581,9 +637,9 @@ def train(
     for epoch in range(1, EPOCHS + 1):
         started = time.perf_counter()
         total = 0.0
-        for item, positive, negative, times, mask in loader:
-            item, positive, negative, times, mask = (
-                tensor.to(TRAIN_DEVICE) for tensor in (item, positive, negative, times, mask)
+        for item, positive, negative, times, mask, weight in loader:
+            item, positive, negative, times, mask, weight = (
+                tensor.to(TRAIN_DEVICE) for tensor in (item, positive, negative, times, mask, weight)
             )
             # bf16 自混精只包住训练步；enabled 里带设备判断，免得在没有 MPS 的机器上误开 CPU 的 bf16
             with torch.autocast(device_type=TRAIN_DEVICE, dtype=torch.bfloat16, enabled=USE_BF16 and TRAIN_DEVICE == "mps"):
@@ -593,6 +649,8 @@ def train(
                 loss = torch.nn.functional.binary_cross_entropy_with_logits(
                     torch.cat([positive_scores, negative_scores]),
                     torch.cat([torch.ones_like(positive_scores), torch.zeros_like(negative_scores)]),
+                    # 正样本按 WEIGHT_MODE 加权（uniform 时全是 1，与不加权等价）；负样本恒为 1
+                    weight=torch.cat([weight[mask], torch.ones_like(negative_scores)]),
                 )
             optimizer.zero_grad()
             loss.backward()
@@ -623,7 +681,7 @@ def main() -> None:
     torch.manual_seed(SEED)
     torch.set_float32_matmul_precision("high")
 
-    train_frame = load("train", ["uid", "item_id", "timestamp"])
+    train_frame = load("train", ["uid", "item_id", "timestamp", "played_ratio_pct"])
     target = load(EVAL_SPLIT, ["uid", "item_id", "is_organic", "played_ratio_pct"])
     n_users = int(train_frame.uid.max()) + 1
     n_items = int(train_frame.item_id.max()) + 1
@@ -686,7 +744,9 @@ def main() -> None:
     if TRAIN_FIRST:
         # 负样本口径：uniform（默认，官方）不需要额外任何东西；hard 要多建两份按 uid 的物品池（见 build_negatives）
         observed, popular = build_negatives(train_frame, n_users, n_items) if NEG_MODE == "hard" else (None, None)
-        model = train(sequences, times, n_items, pad_id, observed, popular)
+        # 正样本权重：uniform（默认，官方）不需要；feedback 要一份与 sequences 对齐的权重（见 build_weights）
+        weights = build_weights(train_frame, n_users, n_items) if WEIGHT_MODE == "feedback" else None
+        model = train(sequences, times, n_items, pad_id, observed, popular, weights)
         model.to(INFER_DEVICE)  # 先搬回 CPU 再存，免得 checkpoint 绑定 MPS
         CHECKPOINT.parent.mkdir(parents=True, exist_ok=True)
         # POS_MODE 与分位边界都写进 checkpoint：两种模式参数形状相同，形状守卫拦不住「装错了位置通道的权重」
