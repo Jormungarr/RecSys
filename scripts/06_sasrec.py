@@ -70,7 +70,7 @@ import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader, Dataset
 
-from rec_eval import evaluate, show, split_by_user
+from rec_eval import evaluate, history_flags, show, split_by_user, target_axes
 
 ROOT = Path(__file__).resolve().parents[1]
 SPLITS_ID = sys.argv[2] if len(sys.argv) > 2 else "a"  # 口径：a = 第一遍（有 val），b = 第二遍（val_size = 0）
@@ -530,7 +530,7 @@ def main() -> None:
     torch.set_float32_matmul_precision("high")
 
     train_frame = load("train", ["uid", "item_id", "timestamp"])
-    target = load(EVAL_SPLIT, ["uid", "item_id"])
+    target = load(EVAL_SPLIT, ["uid", "item_id", "is_organic", "played_ratio_pct"])
     n_users = int(train_frame.uid.max()) + 1
     n_items = int(train_frame.item_id.max()) + 1
     pad_id = n_items  # 官方用 0（它的词表是 1-based）；我们的 0 是真实物品，只能另拿一个 id 当 padding
@@ -657,6 +657,14 @@ def main() -> None:
     ]
     target_history = [train_history[u] for u in target_users]
 
+    # 分层轴（is_organic / 参与度 / 回访×来源）：口径见 rec_eval.py 文件头，列来自 2026-09-22 补进 splits 的三个字段
+    back = history_flags(
+        target.uid.to_numpy(), target.item_id.to_numpy(), train_frame.uid.to_numpy(), train_frame.item_id.to_numpy()
+    )
+    axes = target_axes(
+        target.uid.to_numpy(), target.is_organic.to_numpy(), target.played_ratio_pct.to_numpy(), back
+    )
+
     model.eval()
     item_tensor, mask = pad_sequences(sequences, np.arange(n_users), pad_id)
     times_tensor = pad_times(times, np.arange(n_users))
@@ -677,7 +685,7 @@ def main() -> None:
 
     # tops 按 uid 行序给，chunks 按目标 split 的分组序 —— 必须对齐（见 architecture.md）
     metrics, n_targets = evaluate(
-        list(tops[target_users]), target_chunks, n_items, all_tops=tops, history=target_history
+        list(tops[target_users]), target_chunks, n_items, all_tops=tops, history=target_history, axes=axes
     )
     show(f"[{EVAL_SPLIT}] 官方口径（不过滤已交互物品、目标保留不可排名行）", metrics, n_targets, n_items)
     print(f"\n总耗时 {time.perf_counter() - started:.1f}s")

@@ -41,7 +41,7 @@ import numpy as np
 import pandas as pd
 import scipy.sparse as sp
 
-from rec_eval import evaluate, show, split_by_user
+from rec_eval import evaluate, history_flags, show, split_by_user, target_axes
 
 ROOT = Path(__file__).resolve().parents[1]
 SPLITS_ID = sys.argv[3] if len(sys.argv) > 3 else "a"  # 口径：a = 第一遍（有 val），b = 第二遍（val_size = 0）
@@ -180,6 +180,14 @@ def main() -> None:
     train_history = [np.unique(chunk) for chunk in split_by_user(train.uid.to_numpy(), train.item_id.to_numpy())[1]]
     target_history = [train_history[u] for u in target_users]
 
+    # 分层轴（is_organic / 参与度 / 回访×来源）：口径见 rec_eval.py 文件头，列来自 2026-09-22 补进 splits 的三个字段
+    back = history_flags(
+        target.uid.to_numpy(), target.item_id.to_numpy(), train.uid.to_numpy(), train.item_id.to_numpy()
+    )
+    axes = target_axes(
+        target.uid.to_numpy(), target.is_organic.to_numpy(), target.played_ratio_pct.to_numpy(), back
+    )
+
     if HOUR is None:
         print("\n[扫描] val 上的 hour 网格（官方验证指标 = ndcg@100，即命中率@100）")
         scan = []
@@ -191,7 +199,7 @@ def main() -> None:
             A = user_user_matrix(C, W, n_users)
             tops = top_k(A, Cn_t)
             metrics, _ = evaluate(
-                list(tops[target_users]), target_chunks, n_items, all_tops=tops, history=target_history
+                list(tops[target_users]), target_chunks, n_items, all_tops=tops, history=target_history, axes=axes
             )
             scan.append((hour, metrics))
             print(
@@ -209,7 +217,7 @@ def main() -> None:
         W = column_matrix(pairs.uid[keep], pairs.item[keep], w[keep], n_users, n_items)
         tops = top_k(user_user_matrix(C, W, n_users), Cn_t)
         best_metrics, _ = evaluate(
-            list(tops[target_users]), target_chunks, n_items, all_tops=tops, history=target_history
+            list(tops[target_users]), target_chunks, n_items, all_tops=tops, history=target_history, axes=axes
         )
 
     show(f"[{SPLIT}] 官方口径（不过滤已交互物品、目标保留不可排名行）", best_metrics, len(target_users), n_items)
