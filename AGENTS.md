@@ -1,6 +1,6 @@
 # RecSys — AGENTS.md
 
-> 给 AI agent 的协作约定与索引。最后更新：2026-09-21。
+> 给 AI agent 的协作约定与索引。最后更新：2026-09-22。
 > **项目档案不在这里**：进度与决策在 `memory.md`，管线与口径在 `architecture.md`，专题结论在 `docs/`（见下面的索引）。
 > 判据：**"怎么干"（规则、环境、约定）留本文件；"干了什么、为什么这么设计"进 `memory.md` / `architecture.md` / `docs/`。**
 
@@ -54,6 +54,6 @@
 - 脚本放 `scripts/`，按序号命名（`01_`、`02_`…），朴素 `print`；专题结论放 `docs/`。**库文件**（不是可执行脚本）不编序号，如 `scripts/rec_eval.py`。
 - **档案分层**：本文件只放 agent 相关（协作方式、工作要求、环境、约定、索引）；进度与决策 → `memory.md`；管线与口径 → `architecture.md`；口径的代码级唯一来源写在脚本 docstring 里。
 - 代码的记忆用 `codebase-memory-mcp`（本机：`~/.local/bin/codebase-memory-mcp`，单次调用 `cli <tool>`，如 `search_code`、`query_graph`；本仓库已建索引，项目名 `Users-yukuanzou-workspace-RecSys`，`scripts/`、`docs/` 靠仓库根 `.cbmignore` 的 `!` 规则放回索引）。
-- sasrec 的 checkpoint 有 **5 处守卫**（`MAX_SEQ_LEN` / `EMB` / `LAYERS` / `USE_TIME_FEATURE` / `USE_TIME_BIAS`，都在 `scripts/06_sasrec.py` 顶部）：改这些常量或开关会让旧 checkpoint 装不回去，脚本会给可读提示而不是 traceback。**换配置重训前先把当前最好那份 `cp` 成 `state_l*.pt`**——`state.pt` 每次训练都会被覆写。
+- sasrec 的 checkpoint 有 **7 处守卫**（`MAX_SEQ_LEN` / `EMB` / `LAYERS` / `USE_TIME_FEATURE` / `USE_TIME_BIAS` / `POS_MODE` / `USE_DECAY`，都在 `scripts/06_sasrec.py` 顶部）：改这些常量或开关会让旧 checkpoint 装不回去，脚本会给可读提示而不是 traceback。后两个可用环境变量覆盖（如 `POS_MODE=time_t2v uv run ...`），方便一条命令里连跑多臂。**换配置重训前先把当前最好那份 `cp` 成 `state_l*.pt`**——`state.pt` 每次训练都会被覆写。
 - `data/`、`artifacts/` 一律 gitignore。
 - 量纲/协议类问题**先看官方常量怎么用**，再看数据（这是踩过的坑：绕了四条判据才确认时间戳单位是秒，而官方 `GAP_SIZE=1800` ↔ "Gap: 30 minutes" 一眼就能确认）。

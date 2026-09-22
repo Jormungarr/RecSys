@@ -76,15 +76,20 @@ uv sync
 uv run python scripts/02_build_splits.py   # 需要先下好 data/raw/flat/50m（见 docs/dataset_notes.md）
 uv run python scripts/04_popularity.py     # 约 3 秒
 uv run python scripts/05_itemknn.py        # 13 档 hour 网格约 16 分钟
-uv run python scripts/06_sasrec.py         # 50 epoch：seq 512 / emb 128 / 4 层 自报约 45 分钟（墙钟可能因机器 Idle Sleep 拉长；MPS 训练、CPU 推理）
+uv run python scripts/06_sasrec.py         # 50 epoch；按脚本**当前常量**（emb 64 / 2 层 / seq 512）约 13 分钟（MPS 训练、CPU 推理；墙钟可能因机器 Idle Sleep 拉长）
 ```
+
+**sasrec 的两条注意**（另外三个脚本没有这个问题）：
+
+- **脚本顶部的常量是滚动的**：`EMB` / `LAYERS` / `POS_MODE` / `USE_DECAY` / `USE_TIME_FEATURE` / `USE_TIME_BIAS` 会随实验换，所以"直接跑"得到的是**当前那一组常量**，不等于本 README 表里的那行。表里那行（seq 512 / emb 128 / 4 层，51 秒/epoch）的权重是 `artifacts/sasrec/state_l512_d128_l4.pt`；要重跑同一配置，得先把 `EMB` 改回 128、`LAYERS` 改回 4（50 epoch 约 45 分钟）。
+- **`state.pt` 每次训练都被覆写**，而且它现在装的是 2026-09-22 那批实验的权重（`POS_MODE=time_t2v`、emb 64 / 2 层）。所以 `test` 那条命令只在 checkpoint 与当前常量同配置时才成立；不匹配时守卫会直接给可读提示，不会静默算错（见 `AGENTS.md`）。
 
 在 test 上复现上面那张表（都用 val 选出的档）：
 
 ```bash
 uv run python scripts/04_popularity.py test 1.0   # 约 3 秒
 uv run python scripts/05_itemknn.py test 0.5      # 约 1.5 分钟
-uv run python scripts/06_sasrec.py test           # 约 30 秒，复用 val 那次存的 checkpoint
+uv run python scripts/06_sasrec.py test           # 复用 checkpoint、不重训；sasrec 那格要先用上表的配置训一次（见上面两条注意）
 ```
 
 版本 B 口径（官方表口径，`val_size=0`、没有 val；见 `architecture.md`「实验流程与两套口径（A / B）」）：
@@ -93,7 +98,7 @@ uv run python scripts/06_sasrec.py test           # 约 30 秒，复用 val 那�
 uv run python scripts/02_build_splits.py b        # → artifacts/splits_b/，约 1 分钟
 uv run python scripts/04_popularity.py test 1.0 b # 约 3 秒
 uv run python scripts/05_itemknn.py test 0.5 b    # 约 1.5 分钟
-uv run python scripts/06_sasrec.py train b        # 按当前 MAX_SEQ_LEN（512）重训 B；之后 06_sasrec.py test b 复用 state_b.pt
+uv run python scripts/06_sasrec.py train b        # 按当前常量（emb 64 / 2 层 / seq 512）重训 B；之后 06_sasrec.py test b 复用 state_b.pt（那份恰好就是 d64/2，能直接对上）
 ```
 
 `data/`、`artifacts/`、`vendor/` 都不入库：数据可重新下载、产物可重新生成、上游代码按 clone 方式获取。
@@ -106,6 +111,8 @@ uv run python scripts/06_sasrec.py train b        # 按当前 MAX_SEQ_LEN（512�
 
 ## 当前状态
 
-已完成：数据与切分、EDA、三个基线的独立实现与官方对照、A / B 两套口径与对官方表的逐项对照、sasrec 序列长度 200→512、自写注意力 block（加性偏置；顺带修掉一个让 25% 用户在评测里失效的 NaN 缺陷）、相对时间偏置 b[Δt桶]（试过、变差，开关默认关）、容量包 emb 64→128 + 2 层→4 层（val recall@100 +21.5% / test +22.4%，两个窗口都超过 itemknn）。
+**读表先看这条**：训练在 MPS 上**跨 session 不可复现**（同配置同 seed 差 9~11%，机制未解释；同 session 三次重复的极差是 0.85%）。所以上面表里的绝对值只能当"某一次 session 的抽样"，<1% 的差异判不了；**所有对照必须同 session 背靠背跑**。细节见 `docs/baselines.md`「跨 session 不可复现」。
 
-待办：口径 B 的容量包、排名融合重做（旧结论已作废）、dropout / 早停（现在更值得做）、多 seed 定量噪声、BPR 基线、likes / dislikes 交互、服务化。见 `memory.md`。
+已完成：数据与切分、EDA、三个基线的独立实现与官方对照、A / B 两套口径与对官方表的逐项对照、sasrec 序列长度 200→512、自写注意力 block（加性偏置；顺带修掉一个让 25% 用户在评测里失效的 NaN 缺陷）、Δ 时间特征与相对时间偏置 b[Δt桶]（都试过、都变差，开关默认关）、容量包 emb 64→128 + 2 层→4 层（val recall@100 +21.5% / test +22.4%，两个窗口都超过 itemknn）、提速三杠杆全部验伪（bf16 无收益、`torch.compile` 拒用、其余无入口）、用时间替换位置 `POS_MODE`（连续形态 val +2.7~5.1%，但只在 d64/2 上做过、且不全是严格配对）、`data/raw` 里没进管线的字段与文件盘点。
+
+待办（一次只做一件，完整顺序见 `memory.md` 的快照）：① 把没进管线的字段/文件囊括进来（阶段 1 数据层 + 阶段 2 评测分层，不训练、不破坏现有数字）→ ② 位置通道收尾（重复 mlp / t2v、上 d128/4 验证）→ ③ 拆开 EMB 与层数归因 → ④ dropout / 早停 → ⑤ 口径 B 的容量包。另：排名融合重做（旧结论已作废）、多 seed 定量噪声、BPR 基线、likes / dislikes 交互、服务化。

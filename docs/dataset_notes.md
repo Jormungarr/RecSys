@@ -114,6 +114,37 @@ listens 里的用户/曲目            :   9,238 / 877,168
 
 **数据侧验证**：dislike 中 81.3% 之前播放过该曲目、其中 98.2% 的 dislike 发生在播放之后；unlike 中只有 28.1% 能在窗口内找到对应 like（其余是窗口开始前就已收藏），其中有 like 的 84.7% 时序正确（unlike 晚于 like）。
 
+## 未进管线的字段与文件（2026-09-22 盘点）
+
+原始文件全都下过、sha256 校验过，但**进 `artifacts/splits/` 的只有 `uid/item_id/timestamp` 三列**。以下都没被任何模型看到：
+
+| 文件 | 规模 | 列 | 现状 |
+|---|---|---|---|
+| `flat/50m/listens.parquet` | 46,467,212 行 | uid, timestamp, item_id, **is_organic**, **played_ratio_pct**, **track_length_seconds** | 只用了前三列 |
+| `flat/50m/likes.parquet` | 881,456 行 | uid, timestamp, item_id, is_organic | 完全没用 |
+| `flat/50m/dislikes.parquet` | 107,776 行 | 同上 | 完全没用 |
+| `flat/50m/unlikes.parquet` | 312,972 行 | 同上 | 完全没用 |
+| `flat/50m/undislikes.parquet` | 21,033 行 | 同上 | 完全没用 |
+| `artist_item_mapping.parquet` | 9,271,906 行 / 1,293,394 艺人 / 9,270,506 物品 | artist_id, item_id | 完全没用 |
+| `album_item_mapping.parquet` | 9,651,644 行 / 3,367,691 专辑 / 8,653,783 物品 | album_id, item_id | 完全没用 |
+| `sequential/50m/listens.parquet` | 9,238 行（每用户一行、嵌套列表） | 同 listens 六列 | 不用（序列自己从 flat 建） |
+| `embeddings.parquet` | 13.8 GB | 曲目内容嵌入 | **未下载** |
+
+各字段实测：
+
+| 字段 | 实测 |
+|---|---|
+| `listens.is_organic` | 推荐驱动（0）占 **48.3%**（论文报 48.74%） |
+| 四个反馈文件的 `is_organic` | 推荐驱动占 43.0%（likes）/ 48.1%（dislikes）/ **5.3%**（unlikes）/ 11.0%（undislikes） |
+| `played_ratio_pct` | `=0` 占 7.4%、`<50` 占 **36.6%**（现在被整段丢弃）、`≥50` 占 63.4%；`>100` 占 0.47%；中位/p90/p99 都是 100 |
+| `track_length_seconds` | min 5 / 中位 200 / p90 275 / max 2495 秒；无 0 |
+
+**时间戳是 5 秒分箱**：卡片那句 *"Delta times, binned into 5s units"* 实测成立——`listens.timestamp % 5 == 0` 的比例是 **1.0000**。
+这解释了建模时看到的“**13.1% 的相邻两首时间戳完全相同**”（2026-09-22 的只读检查；口径是**模型输入的最后 512 条窗口**，全历史口径是 12.1%，见 `docs/eda.md`）：同一 5 秒桶内的事件无法用时间区分，所以任何“只用 Δ”的时间编码在那部分位置上也必然重合。
+
+**可以直接用的三件事**（都还没做）：① `played_ratio_pct` 从“阈值”升级成“参与度”（分级加权 / 实际收听秒数 = ratio × length）；
+② 那 36.6% 的 `<50` 行是“点开就划走”的弱负反馈，现在被丢了；③ 艺人/专辑映射让模型知道“这首歌的艺人/专辑你听过”——冷启动（新歌轴）最可能的杠杆。
+
 ## 已知的文档与数据不一致
 
 1. `played_ratio_pct` 卡片写 *1-100*，实测范围 **0 ~ 159**：存在 7.45% 的 0（一次都没播到）、0.469% 的 >100（S1 FAQ 解释为回放/拖动，属正常）。
@@ -125,7 +156,7 @@ listens 里的用户/曲目            :   9,238 / 877,168
 | 事实 | 影响 |
 |---|---|
 | Listen+（`played_ratio_pct >= 50`）保留 63.35% 的事件 | 这是默认的正样本定义 |
-| `is_organic=0`（推荐驱动）占 listens 的 48.3%（论文报 48.74%） | 可做"推荐 vs 主动发现"的对照实验；Unlike 只有 5.01% 是推荐驱动 |
+| `is_organic=0`（推荐驱动）占 listens 的 48.3%（论文报 48.74%） | 可做"推荐 vs 主动发现"的对照实验；Unlike 只有 5.3% 是推荐驱动 |
 | 显式反馈极稀疏（likes ≈ listens 的 1.9%） | 单独用 like 训练样本不足；论文因此分 Listen+ / Like 两套实验 |
 | 稀疏度 = 0.5734%；Top 1% 曲目覆盖 49.2% 的事件；35.7% 曲目只被听 1 次 | 长尾极重，必须走"召回 → 排序"两级结构 |
 | 官方 GTS 协议：训练 300 天 / gap 30 分钟 / 测试 1 天，测试集只占 0.5% | 评测按时间切，不能随机划分 |
@@ -134,7 +165,7 @@ listens 里的用户/曲目            :   9,238 / 877,168
 
 ```bash
 # 环境
-uv venv && uv pip install -r requirements.txt
+uv sync
 
 # 数据样式与字段含义
 uv run python scripts/01_inspect_listens.py

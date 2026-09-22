@@ -1,8 +1,8 @@
 """sasrec 基线：自己实现一份，训练与评测口径对齐官方 benchmark。
 
 运行：
-    uv run python scripts/06_sasrec.py          # 在 val 上训练并评测（50 epoch 约 5.5 分钟）
-    uv run python scripts/06_sasrec.py test     # 在 test 上评测，复用 val 那次存下的 checkpoint（约 1 分钟）
+    uv run python scripts/06_sasrec.py          # 在 val 上训练并评测（50 epoch；按当前常量 emb 64 / 2 层 / seq 512 约 13 分钟）
+    uv run python scripts/06_sasrec.py test     # 在 test 上评测，复用 val 那次存下的 checkpoint（不重训；checkpoint 必须与当前常量同配置，否则被守卫拦下）
     uv run python scripts/06_sasrec.py train b  # 版本 B 口径：在更长的 train 上训练、在 test 上评测（无 val）
 
 口径出处（vendor/yambda-benchmarks/benchmarks/models/sasrec/）：
@@ -19,12 +19,20 @@
   加到**注意力分数**上，`Δt = t_i − t_j`、参照点是查询位自身（训练位置 i 预测 i+1，只用 i 时刻已知的时间）。
   与上一条的区别：Δ 进的是注意力 logits（成对量），不是 token 表示（那是绝对新鲜度、已被位置 embedding 覆盖）。
   桶边界用本机 `TIME_BOUNDS`（对数 13 桶，不是参考实现那个 `max_interval=1024` 秒线性截断，见 `docs/baselines.md`）。
+- **位置通道（`POS_MODE`，2026-09-22 加）**：`index`（默认）= 位置索引查表；`time` = **用时间替换位置** ——
+  同一张位置表、不新增任何参数，下标 = Δ 在**训练集等量分位边界**（511 个，见 `build_time_edges`）里的档号，
+  Δ = 窗口内最后一次已知事件 − t_i。依据：同一用户窗口内 Δ 与位置索引单调一一对应，替换是**换刻度**而不是加信息。
+  （第一版用「线性 Δ / 间隔中位数」：92.7% 的位置挤在末档、每用户中位只用 14 档，已弃；训练前 main() 有硬判据拦这种情况。）
+- **位置通道的四种形态 + 衰减核（2026-09-22 晚加）**：`time`（分位档，整数）/ `time_interp`（同表 + 小数档插值，不新增参数）/
+  `time_mlp`（x = log1p(Δ/200) 过两层 MLP）/ `time_t2v`（可学频率的周期基 [cos(ωx), sin(ωx)]，Bochner/Time2Vec 那一支，
+  只留周期项、不带线性项与相位——线性项会把 item 通道压掉，见 2026-09-22 的失败与修复）；
+  `USE_DECAY` 与位置通道**正交**：把 −λ_head·log1p(Δt) 加到注意力 logits（λ 初值 0 → 起点等于基线）。
+  四种形态都是“用时间替换位置”，开工前会打印**每用户可区分的位置比例**（index 1.00 / 连续 0.96 / 分位档 0.11）。
 - 训练样本（`data.py::TrainDataset`）：item = seq[:-1]、positive = seq[1:]（每个位置都预测下一首），
   负样本**每个位置随机 1 个**；损失 = BCEWithLogits([正分; 负分], [1; 0])
-- 超参（`train.py` 的默认值）：heads 2 / layers 2 / dropout 0.0 / lr 1e-3 / Adam / batch 256 / seed 42；
-  epoch 数官方默认 100，本机按 `docs/benchmark_repro.md` 记录的 50。**偏离官方默认的有三处**：
-  序列长度 512（官方 200）、embedding 维度 128（官方 64）、层数 4（官方 2）——后面两处是容量包实验，
-  也就是说本机现在这份 sasrec 已经不是“官方复现”配置，对表能力由口径 B + 文档记录保留。
+- 超参（`train.py` 的默认值）：heads 2 / dropout 0.0 / lr 1e-3 / Adam / batch 256 / seed 42；
+  epoch 数官方默认 100，本机按 `docs/benchmark_repro.md` 记录的 50。常量是**滚动**的：当前（emb 64 + 2 层）是
+  2026-09-22 第二轮五臂对照用的快迭代配置；最强配置是 emb 128 + 4 层 + 序列 512（权重 `state_l512_d128_l4.pt`）。对表能力由口径 B + 文档记录保留。
 - 评测（`eval.py`）：用户向量 × 全部 item embedding 内积 → top-100，指标走 `scripts/rec_eval.py`
 - 设备：训练用 MPS，**推理必须用 CPU**（官方在 MPS 上跑 eval 会崩，见 `docs/benchmark_repro.md`）；
   推理按用户分批（`INFER_BATCH`）—— 模型对每个用户独立，分批不改变结果，但注意力矩阵是 `(B, heads, L, L)`，
@@ -49,6 +57,8 @@
 注意：训练带随机性（初始化、负采样、数据顺序），不追求与官方逐位一致，只对量级。
 """
 
+import math
+import os
 import random
 import sys
 import time
@@ -70,10 +80,16 @@ CHECKPOINT = ROOT / "artifacts" / "sasrec" / ("state.pt" if SPLITS_ID == "a" els
 
 MAX_SEQ_LEN = 512  # 官方默认 200；本机改 512 —— 训练集历史长度（去重物品）中位 666 / p90 2,239（docs/eda.md），
                    # 截到 200 时一半以上用户的历史被砍掉（实测：两个口径下序列长度中位都正好 = 200，即顶到上限）
-EMB = 128  # 官方默认 64；本机做容量包实验（2026-09-21，与层数 2→4 一起改，见 docs/baselines.md）
+EMB = 64  # 官方默认 64。2026-09-22（第二轮）为了「位置通道四种形态 + 衰减核」的五臂对照临时回到 64/2 层：
+          # 每臂 ~13 分钟、五臂背靠背；代价是结论只在 d64/2 上成立（是否上 d128/4 等这批结果再定）。
+          # 当前最强配置（emb 128 + 4 层）的权重在 state_l512_d128_l4.pt
 HEADS = 2
-LAYERS = 4  # 官方默认 2；与 EMB 一起构成容量包实验
+LAYERS = 2  # 官方默认 2；与 EMB=64 一起构成本轮五臂对照的配置，理由见 EMB 处
 DROPOUT = 0.0
+USE_BF16 = False  # 训练步用 bf16 自混精。微基准：d128/4 层上单步 1110 → 967 ms（同进程交替测 4 轮，−13%）；
+                  # 但 2026-09-22 在 d64/2 层上真跑：epoch 耗时与 fp32 相同（无收益），val recall@100 0.091862
+                  # 落在三次同配置 fp32 重复（0.091091/0.091490/0.091868）的带内 → 无可辨认影响。
+                  # 所以默认关；它在 d128/4 层上是否真能提速从未在真跑里验证过（要用得先单独验）
 LR = 1e-3
 BATCH = 256
 SEED = 42
@@ -95,6 +111,22 @@ USE_TIME_BIAS = False  # 相对时间偏置开关：b[Δt 桶]（可学，按 he
                       # 回访 −4.9%、新歌 −2.8%），但学出的 b 表本身是干净的单调衰减（1min–30min 最高、6 桶后单调降到 −1.4）
                       # → 先验没错，是它和位置 embedding 重复且更弱。见 docs/baselines.md。默认 False。**
                       # checkpoint 里有无 time_bias 必须与开关一致，下有守卫。
+POS_MODE = os.environ.get("POS_MODE", "index")  # 位置通道。可用环境变量覆盖，方便一条命令里连跑多臂
+                    # index       = 位置索引查表（基线）：下标 = 「距查询点第几首」(0..511)
+                    # time        = 用时间替换位置：下标 = Δ 的**等量分位档号**（整数，512 档；实测每用户只有 ~56 档）
+                    # time_interp = 同上，但下标是**小数**（桶内按 log1p 插值到相邻两行），不新增参数
+                    # time_mlp    = 用时间替换位置：x = log1p(Δ/200) → 两层 MLP → EMB（连续、无桶；新增参数）
+                    # time_t2v    = 同上，但用可学频率的周期基 [ω·x+φ, sin(ω·x+φ)] → Linear(2·EMB, EMB)（Time2Vec/Bochner 那一支）
+                    # Δ = 窗口内最后一次已知事件 − t_i（秒；与 delta_buckets_tensor 同一参照点，查询位 Δ = 0）
+                    # 依据：同一用户窗口内 Δ 与位置索引单调一一对应 —— 替换不是加信息，而是**换刻度**（均匀序数 → 真实时间）
+                    # 与 USE_TIME_FEATURE / USE_TIME_BIAS 的区别：那两个是**在位置之外加**时间，都实测变差；这一族是**替换**
+                    # 参数集：index / time / time_interp 完全相同（严格配对）；time_mlp / time_t2v 有新参数，配对性变弱
+                    # checkpoint 里记 `_pos_mode`（形状相同，装错了不会报错、只会静默算出错的分数）
+USE_DECAY = os.environ.get("USE_DECAY", "0") == "1"  # 衰减核：把 −λ_head · log1p(Δt) 加到注意力 logits（λ 每 head 一个、可学、**初值 0** → 起点与基线逐位相同）
+                    # 与位置通道**正交**：这一支保留位置，只把时间放进注意力权重 —— 正面检验 itemknn 的 τ^Δ 那种强先验衰减
+TIME_UNIT = 200.0  # 连续编码的时间单位（秒）= 训练集相邻间隔中位数；只用于 time_mlp / time_t2v 的 x = log1p(Δ / TIME_UNIT)
+TIME_EDGES: torch.Tensor | None = None  # time / time_interp 的 511 个分档边界，由 build_time_edges 装好 / 从 checkpoint 取回
+assert not (POS_MODE != "index" and USE_TIME_FEATURE), "POS_MODE 已经拿 Δ 当位置通道，再叠 USE_TIME_FEATURE 会把归因搅在一起"
 SPLIT = sys.argv[1] if len(sys.argv) > 1 else "val"  # 模式：val（训练+评 val）/ test（复用 checkpoint 评 test）/ train（口径 B：训练+评 test）
 assert not (SPLITS_ID == "b" and SPLIT == "val"), "版本 B 没有 val（val_size = 0）；用 train 训练、用 test 复用 B 的 checkpoint"
 EVAL_SPLIT = "test" if SPLIT == "train" else SPLIT  # 本次评测的窗口
@@ -172,6 +204,71 @@ def delta_buckets_tensor(times: torch.Tensor) -> torch.Tensor:
     return torch.bucketize(times[:, -1:] - times, bounds, right=True, out_int32=True)
 
 
+def build_time_edges(times: list[np.ndarray]) -> torch.Tensor:
+    """训练窗口内 Δ = (该用户最后一次已知事件 − 每次事件) 的 511 个**等量分位**边界 → (511,) int64。
+
+    分位点取 i/512（i = 1..511），所以每个档位的样本量大致相等，且与 Δ 的量纲、重尾程度无关。
+    2026-09-22 的第一版用「线性 Δ / 用户间隔中位数」：位置级 Δ/中位数 p50 已经是 8634（跨 7.4 个数量级），
+    结果 92.7% 的位置挤进最后一档、每用户中位只用 14 档 —— 所以改成等量分位。
+    只用训练集、只算一次（确定性）；它同时写进 checkpoint，评测时从 checkpoint 取，避免两边各算一套。
+    """
+    deltas = np.concatenate([(t[-1] - t).astype(np.int64) for t in times if len(t)])
+    quantiles = np.arange(1, MAX_SEQ_LEN) / MAX_SEQ_LEN
+    return torch.from_numpy(np.round(np.quantile(deltas, quantiles)).astype(np.int64))
+
+
+def time_position_index(times: torch.Tensor) -> torch.Tensor:
+    """(B, L) 时间戳 → (B, L) 的位置表下标，供 POS_MODE="time"（用时间替换位置）用。
+
+    Δ = 该行最后一次已知事件 − t_i（秒；与 `delta_buckets_tensor` 同一个参照点：训练与推理的查询位都恰好 Δ = 0），
+    再按 `TIME_EDGES` 分档。边界是 511 个等量分位点 → 档号恰好落在 [0, MAX_SEQ_LEN-1]，与位置表的行数一一对应。
+    区间约定与 np.searchsorted(side="left") 一致（即 boundaries[i-1] < Δ ≤ boundaries[i]）。
+    padding 位会拿到很大的 Δ（t = 0）→ 落进最后一档，无所谓：它们在注意力里被 mask，输出也不会被读。
+    """
+    assert TIME_EDGES is not None, "POS_MODE=time 需要先用 build_time_edges 装好分位边界（训练路径在 main() 里做）"
+    delta = (times[:, -1:] - times).to(torch.int64)
+    return torch.bucketize(delta, TIME_EDGES.to(delta.device))
+
+
+def time_position_frac(times: torch.Tensor) -> torch.Tensor:
+    """(B, L) → (B, L) 的**小数**位置表下标，供 POS_MODE="time_interp" 用（桶内按 log1p 线性插值）。
+
+    整数部分与 `time_position_index` 共用同一套分位边界，另外把「在该桶里靠上还是靠下」也算进去：
+    桶 (edges[b-1], edges[b]] 内部按 log1p(Δ) 线性给出小数档号 b-1+w。
+    两个不变式：① 档号随 Δ 单调不减；② 在桶边界上**连续**（Δ 恰好等于 edges[b] 时 w=1、r=b，与下一桶的起点一致），
+    所以它只把 time 版的「取整撞档」换成“同一张表的连续混合”，参数一个不增。
+    """
+    assert TIME_EDGES is not None, "POS_MODE=time_interp 需要先用 build_time_edges 装好分位边界"
+    edges = TIME_EDGES.to(times.device)
+    delta = (times[:, -1:] - times).to(torch.int64)
+    bucket = torch.bucketize(delta, edges)  # 0..MAX_SEQ_LEN-1
+    lower = torch.cat([torch.zeros(1, dtype=edges.dtype, device=edges.device), edges])[bucket]
+    upper = torch.cat([edges, torch.full((1,), 1 << 62, dtype=edges.dtype, device=edges.device)])[bucket]
+    x, xl, xh = torch.log1p(delta.float()), torch.log1p(lower.float()), torch.log1p(upper.float())
+    w = ((x - xl) / (xh - xl).clamp(min=1e-6)).clamp(0.0, 1.0)
+    return (bucket - 1 + w).clamp(0, MAX_SEQ_LEN - 1)
+
+
+def time_x(times: torch.Tensor) -> torch.Tensor:
+    """(B, L) → (B, L, 1)：连续时间特征 x = log1p(Δ / TIME_UNIT)，供 time_mlp / time_t2v 用（无桶）。
+
+    TIME_UNIT = 训练集相邻间隔中位数（实测 200 s、p10 142 s，跨用户几乎是常数），作用是把 x 的尺度调到
+    「相邻两首≈ 0.3~1」——数据里 75% 的相邻间隔落在 1~30 分钟，即 x ≈ 0.3~2.3，周期基/MLP 的分辨力落在这里。
+    """
+    delta = (times[:, -1:] - times).float()
+    return torch.log1p(delta / TIME_UNIT).unsqueeze(-1)
+
+
+def pairwise_delta(times: torch.Tensor) -> torch.Tensor:
+    """(B, L, L)：Δt = t_i − t_j（秒，i = 查询位，j = key 位）；供衰减核用。
+
+    与 `pairwise_buckets` 同一前提：因果 + 左填充下**有效位之间** Δt 恒 ≥ 0（对角线为 0）。
+    但 (padding 位, 有效位) 这种组合会给出负数（padding 的时间戳是 0），所以调用方必须自己在 0 处截断：
+    `log1p(负的大数)` 是 NaN，而 NaN 加到 −inf 掩码上会把整块掩码污染成 NaN（自检里抓到过）。
+    """
+    return (times[:, :, None] - times[:, None, :]).float()
+
+
 def pairwise_buckets(times: torch.Tensor) -> torch.Tensor:
     """(B, 512) 时间戳 → (B, 512, 512) 的 Δt 桶编号，Δt = t_i − t_j（i = 查询位，j = key 位）；供 `USE_TIME_BIAS` 用。
 
@@ -223,12 +320,29 @@ class Encoder(nn.Module):
 
 
 class SASRec(nn.Module):
-    """官方 SASRecEncoder + 本机加的 Δ 时间 embedding：item + 位置 + 时间 → LayerNorm → Dropout → 因果 Transformer → 最后一格。"""
+    """官方 SASRecEncoder + 本机加的 Δ 时间 embedding：item + 位置（POS_MODE 决定来源）+ 时间 → LayerNorm → Dropout → 因果 Transformer → 最后一格。"""
 
     def __init__(self, n_items: int, pad_id: int) -> None:
         super().__init__()
         self.item_embedding = nn.Embedding(n_items + 1, EMB, padding_idx=pad_id)
-        self.position_embedding = nn.Embedding(MAX_SEQ_LEN, EMB)
+        if POS_MODE in ("index", "time", "time_interp"):
+            # index 用「第几首」当行号、time 用整数档号、time_interp 用小数档号 —— 三者共用同一张表（参数集完全相同）
+            self.position_embedding = nn.Embedding(MAX_SEQ_LEN, EMB)
+        elif POS_MODE == "time_mlp":
+            self.position_time = nn.Sequential(nn.Linear(1, EMB), nn.GELU(), nn.Linear(EMB, EMB))
+        elif POS_MODE == "time_t2v":
+            # Bochner / Time2Vec 那一支：**只留周期项** [cos(ωx), sin(ωx)]，不带线性项、不带相位。
+            # 线性项 ω·x+φ 的量级就是 x 本身（x 最大 ~11.7）→ 实测初始化时该通道 RMS 2.034，
+            # 而 item 通道只有 0.018（**113 倍**），LayerNorm 一归一化就把 item 信号压掉：
+            # 这就是 2026-09-22 第一版 T2V 训不起来的原因（loss 停在 0.1587，基线 0.0471）。
+            # 相位去掉：cos/sin 同时存在时，相位只是两者的线性组合，投影层自己能表示。
+            # 缩放见 forward 里的 sqrt(1/(2·EMB))。
+            self.time_omega = nn.Parameter(torch.empty(EMB))
+            self.time_proj = nn.Linear(2 * EMB, EMB)
+        else:
+            raise ValueError(f"POS_MODE 只能是 index / time / time_interp / time_mlp / time_t2v，收到 {POS_MODE!r}")
+        if USE_DECAY:
+            self.decay_lambda = nn.Parameter(torch.zeros(HEADS))  # 每 head 一个衰减强度
         if USE_TIME_FEATURE:
             self.time_embedding = nn.Embedding(N_TIME_BUCKETS, EMB)  # Δ 时间分桶（本机加的，官方没有）
         if USE_TIME_BIAS:
@@ -250,11 +364,38 @@ class SASRec(nn.Module):
                 nn.init.zeros_(value.data)
         if USE_TIME_BIAS:
             nn.init.zeros_(self.time_bias.weight)  # 从「没有偏置」起步：第一轮的行为就是 b ≡ 0 那版，便于对照
+        if POS_MODE == "time_t2v":
+            # 上面那个通用初始化循环会把 ω 当 bias 清零（名字里没有 "weight"），所以在这里显式给初值。
+            # ω log-uniform 铺在数据的 x 质量区间上：x = log1p(Δ/200)，75% 的相邻对落在 x ≈ 0.3~2.3，
+            # 取周期 2π/ω ∈ [0.25, 4]（ω ≈ [1.57, 25.1]）→ 既有粗粒度平滑、也有细粒度振荡。
+            # 频率初始化**没调过**；要调就是这一处。
+            with torch.no_grad():
+                low, high = math.log(2 * math.pi / 4), math.log(2 * math.pi / 0.25)
+                self.time_omega.copy_(torch.exp(torch.empty(EMB).uniform_(low, high)))
+        if USE_DECAY:
+            nn.init.zeros_(self.decay_lambda)  # 核 ≡ 0 起步，与基线逐位相同
 
     def forward(self, item: torch.Tensor, times: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
-        """item / times (B, 512) 已左填充 → (B, 512, EMB)。位置倒序编号：最新行为是 0。"""
-        positions = torch.arange(MAX_SEQ_LEN - 1, -1, -1, device=item.device)
-        embeddings = self.item_embedding(item) + self.position_embedding(positions)
+        """item / times (B, 512) 已左填充 → (B, 512, EMB)。位置编号倒序：最新行为是 0。"""
+        if POS_MODE == "index":
+            positions = torch.arange(MAX_SEQ_LEN - 1, -1, -1, device=item.device)
+            position_part = self.position_embedding(positions).unsqueeze(0)  # (L, EMB)：所有行共用同一份
+        elif POS_MODE == "time":
+            position_part = self.position_embedding(time_position_index(times))  # (B, L, EMB)：整数分位档
+        elif POS_MODE == "time_interp":
+            r = time_position_frac(times)  # 小数档号：同一张表按相邻两行线性混合
+            i0 = r.floor().clamp(0, MAX_SEQ_LEN - 2).long()
+            w = (r - i0).unsqueeze(-1)
+            position_part = (1 - w) * self.position_embedding(i0) + w * self.position_embedding(i0 + 1)
+        elif POS_MODE == "time_mlp":
+            position_part = self.position_time(time_x(times))
+        else:  # time_t2v
+            angle = self.time_omega * time_x(times)  # (B, L, EMB)
+            feat = torch.cat([torch.cos(angle), torch.sin(angle)], dim=-1)
+            # sqrt(1/(2·EMB))：Bochner/RFF 的标准归一（features 的 RMS 压到 ~0.09），
+            # 顺带把通道幅度对齐到 item 通道（实测 RMS 0.141 → 0.02，item 是 0.018）
+            position_part = self.time_proj(feat * math.sqrt(1.0 / (2 * EMB)))
+        embeddings = self.item_embedding(item) + position_part
         if USE_TIME_FEATURE:
             embeddings = embeddings + self.time_embedding(delta_buckets_tensor(times))
         embeddings = self.dropout(self.layernorm(embeddings))
@@ -277,6 +418,11 @@ class SASRec(nn.Module):
             # b[Δt 桶] 加到注意力分数上（不是取代点积）。Δt 的桶由原始时间戳按查询位参照现算，各层共用这一份：
             # 每层重算等于把参考书里讲的 O(N²) 访存瓶颈乘上层数。
             attn_mask += self.time_bias(pairwise_buckets(times)).permute(0, 3, 1, 2)
+        if USE_DECAY:
+            # −λ_head · log1p(Δt)：λ 初值 0 → 起步与基线逐位相同；被 mask 的 key 是 −inf，加完仍是 −inf。
+            # Δt 必须先在 0 处截断：padding 行的时间戳是 0，与有效位相减得到负数，而 log1p(负数大) 是 NaN，
+            # NaN 加到 −inf 上会把整块掩码变成 NaN（自检里就是这么抓到的）。
+            attn_mask += -self.decay_lambda.view(1, -1, 1, 1) * torch.log1p(pairwise_delta(times).clamp(min=0.0)).unsqueeze(1)
         return self.encoder(embeddings * mask.unsqueeze(-1), attn_mask.view(-1, MAX_SEQ_LEN, MAX_SEQ_LEN))
 
 
@@ -345,13 +491,15 @@ def train(sequences: list[np.ndarray], times: list[np.ndarray], n_items: int, pa
             item, positive, negative, times, mask = (
                 tensor.to(TRAIN_DEVICE) for tensor in (item, positive, negative, times, mask)
             )
-            query = model(item, times, mask)[mask]
-            positive_scores = (query * model.item_embedding(positive[mask])).sum(dim=-1)
-            negative_scores = (query * model.item_embedding(negative[mask])).sum(dim=-1)
-            loss = torch.nn.functional.binary_cross_entropy_with_logits(
-                torch.cat([positive_scores, negative_scores]),
-                torch.cat([torch.ones_like(positive_scores), torch.zeros_like(negative_scores)]),
-            )
+            # bf16 自混精只包住训练步；enabled 里带设备判断，免得在没有 MPS 的机器上误开 CPU 的 bf16
+            with torch.autocast(device_type=TRAIN_DEVICE, dtype=torch.bfloat16, enabled=USE_BF16 and TRAIN_DEVICE == "mps"):
+                query = model(item, times, mask)[mask]
+                positive_scores = (query * model.item_embedding(positive[mask])).sum(dim=-1)
+                negative_scores = (query * model.item_embedding(negative[mask])).sum(dim=-1)
+                loss = torch.nn.functional.binary_cross_entropy_with_logits(
+                    torch.cat([positive_scores, negative_scores]),
+                    torch.cat([torch.ones_like(positive_scores), torch.zeros_like(negative_scores)]),
+                )
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
@@ -374,6 +522,7 @@ def top_k(user_vectors: np.ndarray, item_vectors: np.ndarray, batch: int = 128) 
 
 
 def main() -> None:
+    global TIME_EDGES  # POS_MODE="time" 时在这里把训练集的等量分位边界装好（见 build_time_edges）
     started = time.perf_counter()
     random.seed(SEED)
     np.random.seed(SEED)
@@ -397,6 +546,35 @@ def main() -> None:
     delta_demo = delta_buckets(times[int(np.argmax(lengths))])
     print(f"序列长度: 中位 {int(np.median(lengths))} / 最大 {lengths.max()} / 截断到 {MAX_SEQ_LEN}")
     print(f"时间特征: {N_TIME_BUCKETS} 个对数桶，边界 {TIME_BOUNDS}；最长序列的 Δ 桶分布前 10 = {delta_demo[:10].tolist()}")
+    if TRAIN_FIRST and POS_MODE != "index":
+        # 开工前只看两件事（0 成本）：① 位置通道的档位占用（防「92.7% 挤一档」那种退化）；
+        # ② **每用户可区分的位置比例**（分位档 0.11 / 连续 0.96 —— 这条是 2026-09-22 才学会要量的）。
+        all_users = np.arange(n_users)
+        _, mask_all = pad_sequences(sequences, all_users, pad_id)
+        all_times = pad_times(times, all_users)
+        if POS_MODE in ("time", "time_interp"):
+            TIME_EDGES = build_time_edges(times)
+            deltas = np.concatenate([(t[-1] - t).astype(np.int64) for t in times if len(t)])
+            buckets = np.searchsorted(TIME_EDGES.numpy(), deltas, side="left")  # 与 torch.bucketize 同一区间约定
+            share = np.bincount(buckets, minlength=MAX_SEQ_LEN) / deltas.size
+            picked = [int(v) for v in TIME_EDGES[[0, 1, 127, 255, 383, 510]]]
+            print(f"位置档占用（{deltas.size:,} 个训练位置 / {MAX_SEQ_LEN} 档）：最大档 {int(share.argmax())} = {share.max():.2%}，"
+                  f"用到的档 {int((share > 0).sum())}，头两档 {share[0]:.2%}/{share[1]:.2%}，末档 {share[-1]:.2%}")
+            print(f"分位边界（秒，取 6 个代表）：{picked}；其余 {MAX_SEQ_LEN - 7} 个随 checkpoint 存档")
+            assert share.max() < 0.30, (
+                f"最大档占比 {share.max():.1%} ≥ 30%：位置档退化（线性刻度那版是 92.7% 挤一档）。先修刻度再训"
+            )
+        with torch.no_grad():
+            if POS_MODE == "time":
+                code = time_position_index(all_times)
+            elif POS_MODE == "time_interp":
+                code = time_position_frac(all_times)
+            else:
+                code = time_x(all_times)[..., 0]
+            code, m = code.numpy(), mask_all.numpy()
+        distinct = np.array([len(np.unique(code[i][m[i]])) / max(int(m[i].sum()), 1) for i in range(n_users)])
+        print(f"位置通道（POS_MODE={POS_MODE}）每用户可区分的位置比例：中位 {np.median(distinct):.2f} / "
+              f"p10 {np.percentile(distinct, 10):.2f}（index 基线 = 1.00）")
     if USE_TIME_BIAS:
         # 开工前先看 Δt 桶的占用：确认 13 个桶都有样本、长桶不是只由 padding 撑起来的
         sample = np.arange(min(64, n_users))
@@ -415,17 +593,37 @@ def main() -> None:
         model = train(sequences, times, n_items, pad_id)
         model.to(INFER_DEVICE)  # 先搬回 CPU 再存，免得 checkpoint 绑定 MPS
         CHECKPOINT.parent.mkdir(parents=True, exist_ok=True)
-        torch.save(model.state_dict(), CHECKPOINT)
+        # POS_MODE 与分位边界都写进 checkpoint：两种模式参数形状相同，形状守卫拦不住「装错了位置通道的权重」
+        payload = {**model.state_dict(), "_pos_mode": POS_MODE}
+        if POS_MODE in ("time", "time_interp"):
+            payload["_time_edges"] = TIME_EDGES  # 让评测/复评用同一套分档边界，而不是另算一套
+        torch.save(payload, CHECKPOINT)
         print(f"checkpoint: {CHECKPOINT.relative_to(ROOT)}")
     else:
         model = SASRec(n_items, pad_id).to(INFER_DEVICE)
         state = torch.load(CHECKPOINT, map_location=INFER_DEVICE)
-        saved_len = state["position_embedding.weight"].shape[0]
-        saved_emb = state["item_embedding.weight"].shape[1]
-        assert saved_len == MAX_SEQ_LEN, (
-            f"{CHECKPOINT.name} 的位置 embedding 是 {saved_len} 行，而 MAX_SEQ_LEN = {MAX_SEQ_LEN}："
-            "换过序列长度后要先按当前配置重训一次（对应模式会覆盖该 checkpoint），再回来评测"
+        # 老 checkpoint 没有这个键（那时只有 index 一种模式），默认值就是它真实的值
+        saved_mode = state.pop("_pos_mode", "index")
+        assert saved_mode == POS_MODE, (
+            f"{CHECKPOINT.name} 是 POS_MODE={saved_mode!r} 训出来的，而当前 POS_MODE={POS_MODE!r}："
+            "两种模式参数形状相同、装错了不会报错，只会静默算出错的分数 → 换模式后要按当前模式重训"
         )
+        saved_edges = state.pop("_time_edges", None)
+        if POS_MODE in ("time", "time_interp"):
+            assert saved_edges is not None, (
+                f"{CHECKPOINT.name} 里没有分档边界（_time_edges）：这一版要按当前代码重训一次，别用历史 checkpoint 复评"
+            )
+            TIME_EDGES = saved_edges
+        assert USE_DECAY == ("decay_lambda" in state), (
+            f"{CHECKPOINT.name} 的衰减核与当前 USE_DECAY={USE_DECAY} 不一致：先重训或把开关改回来"
+        )
+        saved_emb = state["item_embedding.weight"].shape[1]
+        if POS_MODE in ("index", "time", "time_interp"):
+            saved_len = state["position_embedding.weight"].shape[0]
+            assert saved_len == MAX_SEQ_LEN, (
+                f"{CHECKPOINT.name} 的位置 embedding 是 {saved_len} 行，而 MAX_SEQ_LEN = {MAX_SEQ_LEN}："
+                "换过序列长度后要先按当前配置重训一次（对应模式会覆盖该 checkpoint），再回来评测"
+            )
         assert saved_emb == EMB, (
             f"{CHECKPOINT.name} 的 embedding 维度是 {saved_emb}，而 EMB = {EMB}："
             "换过维度后要先按当前配置重训一次（对应模式会覆盖该 checkpoint），再回来评测"
