@@ -128,7 +128,7 @@ listens 里的用户/曲目            :   9,238 / 877,168
 | `artist_item_mapping.parquet` | 9,271,906 行 / 1,293,394 艺人 / 9,270,506 物品 | artist_id, item_id | 完全没用 |
 | `album_item_mapping.parquet` | 9,651,644 行 / 3,367,691 专辑 / 8,653,783 物品 | album_id, item_id | 完全没用 |
 | `sequential/50m/listens.parquet` | 9,238 行（每用户一行、嵌套列表） | 同 listens 六列 | 不用（序列自己从 flat 建） |
-| `embeddings.parquet` | 13.8 GB | 曲目内容嵌入 | **未下载** |
+| `embeddings.parquet` | 13.8 GB / 覆盖 7.72M 轨 | **音频**嵌入（卡片原文 “Track audio-embeddings”，列 `item_id` / `embed` / `normalized_embed`；生成方式：*“a convolutional neural network inspired by Contrastive Learning of Musical Representations (J. Spijkervet et al., 2021)”*） | **未下载**；约 1.8 KB/轨（float32 下 ≈ 450 维，具体维度要下下来才知道） |
 
 各字段实测：
 
@@ -146,6 +146,14 @@ listens 里的用户/曲目            :   9,238 / 877,168
 ② 那 36.6% 的 `<50` 行是“点开就划走”的弱负反馈，现在被丢了；③ 艺人/专辑映射让模型知道“这首歌的艺人/专辑你听过”——冷启动（新歌轴）最可能的杠杆。
 
 **2026-09-22 阶段 1：以上字段与文件已落进 artifacts**（见 `memory.md`「已完成」27）。口径 A / B 各一套，与 splits 同一套 id 空间与 `-1` 约定：`train/val/test.parquet` 补了 `is_organic` / `played_ratio_pct` / `track_length_seconds` 三列（正样本定义与行集合不变）；另存 `feedback.parquet`（四个反馈 + `event_type`）、`weak_negative.parquet`（**训练窗口**内 `<50` 的行，A 1,650 万 / B 1,658 万行）、`item_artist.parquet` / `item_album.parquet`（只覆盖该口径训练集的物品，覆盖 99.57% / 99.96%）。**模型还没用到它们。**
+
+**冷物品（外推）在我们这套离线口径里几乎量不到**（2026-09-22 只读核算，未入库）：我们只保留训练集出现过的 uid、候选池 = 训练集物品，
+所以目标里“训练期没出现过的物品”记 `-1` 且**必然未命中**——val **1,928 行（1.34%）** / test **2,332 行（1.48%）**。
+这些冷物品里绝大多数能拿到艺人映射（99.5% / 98.5%），但**大多属于训练期见过的艺人**（val 1,378 / 1,631 = 84.5%，test 1,457 / 1,755 = 83.0%），
+**真正的新艺人只有 253（val）/ 298（test）个物品**（新专辑 701 / 768）。
+**官方口径不同**：官方 sasrec 的候选池是**全部 Listen+ 物品（631,004）**（见 `docs/benchmark_repro.md`），所以官方下冷物品是**可排名**的；
+卡片 FAQ 也明确 *“Are test items presented in training data? Not all, some test items do appear in the training set, others do not.”*（且没有冷用户）。
+→ 真要量冷启动，得单开一条口径（候选池含全部 Listen+ 物品），那会与现有历史表**不可比**。
 
 ## 已知的文档与数据不一致
 
