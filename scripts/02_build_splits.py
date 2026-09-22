@@ -44,7 +44,8 @@ TRAIN_END = TEST_TIMESTAMP - GAP_SIZE - VAL_SIZE - (GAP_SIZE if VAL_SIZE else 0)
 VAL_START = TEST_TIMESTAMP - VAL_SIZE - GAP_SIZE  # 25,825,400
 VAL_END = TEST_TIMESTAMP - GAP_SIZE  # 25,911,800
 
-COLUMNS = ["uid", "item_id", "timestamp", "played_ratio_pct"]
+COLUMNS = ["uid", "item_id", "timestamp", "played_ratio_pct", "is_organic", "track_length_seconds"]
+MAPPING = ROOT / "data" / "raw"  # artist_item_mapping / album_item_mapping 在 raw 根下，不在 flat/50m/
 
 
 def is_sorted(uid: np.ndarray, timestamp: np.ndarray) -> bool:
@@ -57,6 +58,81 @@ def densify(raw: np.ndarray, universe: np.ndarray) -> np.ndarray:
     pos = np.searchsorted(universe, raw)
     pos_clipped = np.clip(pos, 0, len(universe) - 1)
     return np.where(universe[pos_clipped] == raw, pos_clipped, -1).astype("int32")
+
+
+def write_feedback(out: Path, train_uids: np.ndarray, train_items: np.ndarray) -> None:
+    """四个显式反馈合并成一张表（+event_type），id 落进本口径的 id 空间。
+
+    与 val/test 同一套约定：uid 只留训练集用户、物品落不到训练集记 -1（不丢行，让下游自己决定）。
+    """
+    parts = []
+    for name in ("likes", "dislikes", "unlikes", "undislikes"):
+        part = pd.read_parquet(SRC.parent / f"{name}.parquet")
+        part["event_type"] = name[:-1]  # likes -> like
+        parts.append(part)
+    feedback = pd.concat(parts, ignore_index=True)
+    dense = pd.DataFrame(
+        {
+            "uid": densify(feedback.uid.to_numpy(), train_uids),
+            "item_id": densify(feedback.item_id.to_numpy(), train_items),
+            "timestamp": feedback.timestamp.to_numpy().astype("int32"),
+            "is_organic": feedback.is_organic.to_numpy().astype("int8"),
+            "event_type": pd.Categorical(
+                feedback.event_type, categories=["like", "dislike", "unlike", "undislike"]
+            ),
+        }
+    )
+    path = out / "feedback.parquet"
+    dense.to_parquet(path, index=False)
+    print(
+        f"写出                   : {path.relative_to(ROOT)}（{len(dense):,} 行；"
+        f"uid 落不到训练集 {int((dense.uid == -1).sum()):,} / 物品落不到 -1 {int((dense.item_id == -1).sum()):,}）"
+    )
+
+
+def write_weak_negative(frame: pd.DataFrame, out: Path, train_uids: np.ndarray, train_items: np.ndarray) -> None:
+    """Listen+ 丢掉的那部分（`played_ratio_pct < 50`）在**训练窗口**内的行，弱负反馈素材。
+
+    与上面不同：这是**训练侧**的表，uid / 物品落不进本口径 id 空间的行留着没有意义，直接丢。
+    """
+    weak = frame[(frame.played_ratio_pct < LISTEN_THRESHOLD) & (frame.timestamp < TRAIN_END)]
+    uid = densify(weak.uid.to_numpy(), train_uids)
+    item = densify(weak.item_id.to_numpy(), train_items)
+    keep = (uid >= 0) & (item >= 0)
+    dense = pd.DataFrame(
+        {
+            "uid": uid[keep],
+            "item_id": item[keep],
+            "timestamp": weak.timestamp.to_numpy()[keep].astype("int32"),
+            "played_ratio_pct": weak.played_ratio_pct.to_numpy()[keep].astype("int16"),
+            "is_organic": weak.is_organic.to_numpy()[keep].astype("int8"),
+        }
+    )
+    path = out / "weak_negative.parquet"
+    dense.to_parquet(path, index=False)
+    print(
+        f"写出                   : {path.relative_to(ROOT)}（{len(dense):,} 行 = 训练窗口内 Listen−；"
+        f"丢掉 {int((~keep).sum()):,} 行（uid 或物品不在训练集））"
+    )
+
+
+def write_item_meta(out: Path, train_items: np.ndarray) -> None:
+    """艺人 / 专辑映射，只保留本口径训练集里的物品（id 已重编号）。"""
+    for name, column, filename in (
+        ("artist_item_mapping", "artist_id", "item_artist.parquet"),
+        ("album_item_mapping", "album_id", "item_album.parquet"),
+    ):
+        mapping = pd.read_parquet(MAPPING / f"{name}.parquet")
+        sub = mapping[np.isin(mapping.item_id.to_numpy(), train_items)]
+        dense = pd.DataFrame(
+            {"item_id": densify(sub.item_id.to_numpy(), train_items), column: sub[column].to_numpy()}
+        ).drop_duplicates()  # 一个物品可能挂多个艺人 / 专辑
+        path = out / filename
+        dense.to_parquet(path, index=False)
+        print(
+            f"写出                   : {path.relative_to(ROOT)}（{len(dense):,} 对；"
+            f"覆盖物品 {dense.item_id.nunique():,} / {len(train_items):,}，{column} {dense[column].nunique():,} 个）"
+        )
 
 
 def main() -> None:
@@ -99,6 +175,10 @@ def main() -> None:
                 "uid": densify(part.uid.to_numpy(), train_uids),
                 "item_id": densify(part.item_id.to_numpy(), train_items),
                 "timestamp": part.timestamp.to_numpy().astype("int32"),
+                # 2026-09-22：原本被丢掉的字段也带进来（正样本定义与行集合不变，只是加列）
+                "is_organic": part.is_organic.to_numpy().astype("int8"),
+                "played_ratio_pct": part.played_ratio_pct.to_numpy().astype("int16"),
+                "track_length_seconds": part.track_length_seconds.to_numpy().astype("int16"),
             }
         )
         assert is_sorted(dense.uid.to_numpy(), dense.timestamp.to_numpy()), f"{name} 应保持 (uid, timestamp) 升序"
@@ -119,6 +199,12 @@ def main() -> None:
     uid_map.to_parquet(OUT / "uid_map.parquet", index=False)
     item_map.to_parquet(OUT / "item_map.parquet", index=False)
     print(f"写出                   : {OUT.relative_to(ROOT)}/uid_map.parquet、item_map.parquet")
+
+    # 没进管线的字段与文件也一并落到同一套 id 空间（盘点见 docs/dataset_notes.md「未进管线的字段与文件」）。
+    # 只加表、不改上面 splits 的行集合与正样本定义，所以三个基线的数字不受影响。
+    write_feedback(OUT, train_uids, train_items)
+    write_weak_negative(frame, OUT, train_uids, train_items)
+    write_item_meta(OUT, train_items)
 
 
 if __name__ == "__main__":

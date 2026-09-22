@@ -29,6 +29,7 @@ scripts/06_sasrec.py（训练 → 序列末向量 × 物品表 → 评测）    
   - test `timestamp >= 25,913,600`
   - 两段 gap 各 1,800 秒；**只保留训练集出现过的 uid**；物品**不做**过滤。
 - 规模：train 29,135,186 行 / val 143,557 行 / test 157,695 行；有目标的用户 4,627 / 4,599。
+- splits 的表除 `uid` / `item_id` / `timestamp` 外还带 `is_organic` / `played_ratio_pct` / `track_length_seconds`（2026-09-22 加；**只加列**，正样本定义与行集合不变，三个基线数字逐项未变）；另外四张表（`feedback` / `weak_negative` / `item_artist` / `item_album`）见 `docs/dataset_notes.md`「未进管线的字段与文件」。
 
 ## id 空间与 `-1` 约定
 
@@ -87,6 +88,7 @@ scripts/06_sasrec.py（训练 → 序列末向量 × 物品表 → 评测）    
 | `memory.md` | 进度、关键决策与理由、数据与产物状态、杂项 |
 | `architecture.md` | 本文档 |
 | `data/`、`artifacts/`、`vendor/` | 一律 gitignore：原始数据 / 产物 / 上游代码 |
+| `artifacts/splits[_b]/` | 切分 + `uid_map` / `item_map` + 四张附加表（`feedback` / `weak_negative` / `item_artist` / `item_album`，2026-09-22 阶段 1 加） |
 
 ## 为什么这么设计
 

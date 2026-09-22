@@ -29,7 +29,9 @@
 3. **单 seed 42**：同 session 噪声带 0.85%（3 次重复），跨 session 更大。
 4. **口径 B 没跟上**：B 上的 sasrec 还是 d64 / 2 层（修正后 0.094515），"能对官方表"与"当前最好"目前是两个配置。
 
-**下一步建议顺序**（每步只改一处，且必须同 session 背靠背）：① **把没进管线的字段/文件囊括进来**（阶段 1 数据层 + 阶段 2 评测分层，都不训练、不破坏现有数字，见「待办」）→ ② 位置通道的收尾（重复 mlp / t2v、上 d128/4 验证）→ ③ 拆开 EMB / 层数把容量包归因 → ④ dropout / 早停 → ⑤ 口径 B 的容量包。
+**下一步建议顺序**（每步只改一处，且必须同 session 背靠背）：① 把没进管线的字段/文件囊括进来——**阶段 1 数据层已完成（见「已完成」27），下一步做阶段 2 评测分层**→ ② 位置通道的收尾（重复 mlp / t2v、上 d128/4 验证）→ ③ 拆开 EMB / 层数把容量包归因 → ④ dropout / 早停 → ⑤ 口径 B 的容量包。
+
+**用户 2026-09-22 定的口径（模型侧）**：位置通道收尾 / 容量包归因 / dropout 早停 / 口径 B 容量包**现在都不做**；之后所有模型实验一律在**原始架构 d64/2（输入只有 item + position）**上做，这样能直接与已有 baseline 对比，不另开对照组。
 
 **读什么**：`architecture.md`（数据流与 A / B 口径）、`docs/baselines.md`（三个模型的数字、NaN 缺陷说明、两个新实验）、`docs/eda.md`（数据动机）、`docs/dataset_notes.md`（数据集事实与坑）；协作规则在 `AGENTS.md`。sasrec 一轮 50 epoch：d128/4 ≈ 45 分钟，**按脚本当前常量（d64/2）≈ 13 分钟**（MPS 训练 / CPU 推理；长时任务用 `bg-train` skill；自报时间不含机器 Idle Sleep）。
 
@@ -63,6 +65,7 @@
 24. **衰减核的正面检验**：每 head 一个 λ（初值 0 → 起点与基线逐位相同，自检过），学出 λ = 0.318 / 0.332（**正的**）→ 模型确实要衰减先验；指标 +1.3%（不可判定），但**强先验优于上一轮的自由 b 表（−4.4%）**，与 itemknn 的 τ^Δ 互相印证。代价：Δt 现算让每 epoch +40%。
 25. **数据盘点：`data/raw` 里没进管线的字段与文件**（2026-09-22）：listens 的 `is_organic`（推荐驱动 48.3%）/ `played_ratio_pct`（`<50` 的 36.6% 被整段丢弃）/ `track_length_seconds`（5~2495 s）；四个显式反馈文件（88 万 / 10.8 万 / 31.3 万 / 2.1 万行，各带 is_organic）；`artist_item_mapping`（927 万行 / 129 万艺人）与 `album_item_mapping`（965 万行 / 337 万专辑）；`sequential/50m/listens.parquet`（未用）；`embeddings.parquet`（13.8 GB，**未下载**）。另：**时间戳是 5 秒分箱**（`%5==0` 占 100%），这就是“13.1% 相邻并列”的来源。→ `docs/dataset_notes.md`「未进管线的字段与文件」
 26. **文档与现状对齐**（2026-09-22）：README 的 sasrec 跑法（常量滚动 / `state.pt` 每次训练被覆写 / 表里那行的权重在 `state_l512_d128_l4.pt`）与「当前状态」、`AGENTS.md` 的守卫数量（5 → **7**）、`architecture.md` 的 A 口径耗时、`docs/dataset_notes.md` 的三处数字（unlikes 推荐驱动 5.3%、13.1% 并列的**分母是模型输入的最后 512 条窗口**、复现命令改 `uv sync`）、`docs/baselines.md`「容量包」的权重所在，全部改到与仓库现状一致。核对方式是把 README 的 test 命令实跑一遍：`04`/`05` 与表逐项相同，`06` 被守卫拦下（`state.pt` 现在是 `POS_MODE=time_t2v` 那臂）。
+27. **阶段 1（数据层）落地：把没进管线的字段 / 文件囊括进来**（2026-09-22）：`scripts/02_build_splits.py` 给 splits 补三列（`is_organic` / `played_ratio_pct` / `track_length_seconds`，**正样本定义与行集合一字未变**、旧三列逐位校验相同），并另存四张表（同口径、同 id 空间、同 `-1` 约定）：`feedback.parquet`（四个反馈合并 + `event_type`，132.3 万行）、`weak_negative.parquet`（**训练窗口**内 `played_ratio_pct < 50`，A 1,650 万 / B 1,658 万行）、`item_artist.parquet`（A 62.5 万对 / 8.3 万艺人 / 覆盖 99.57% 物品）、`item_album.parquet`（A 102.9 万对 / 34.3 万专辑 / 覆盖 99.96%）；A、B 各一套。**回归**：`04`（val、test、口径 B）、`05`（test）、`06`（口径 B）数字逐项未变。附带发现：**Listen+ 里推荐驱动（`is_organic=0`）反而更多**（52.03%，全量 48.34%、Listen− 41.97%）。→ `docs/dataset_notes.md`、`architecture.md`
 
 **待办**
 
@@ -97,7 +100,7 @@
   **形态选择的判据（只读检查已给出）**：① 并列占 13.1%、只有 9.6% 的相邻间隔超过 30 分钟 → **纯时间编码最多只能在约 10~23% 的位置上产生差异**，所以别期待大幅度；② 分位档区分度 0.11 vs 连续 0.96 → **要做时间通道就上连续（C 或 D）**，不要再用桶；③ 要让时间“管什么”而不抢位置的活，选 B/C/E；要保住严格配对，选 D/E。
   **开工前必须先量的（只读、0 成本）**：并列比例 / 间隔分布 / 新通道的区分度（本轮检查脚本在 `/tmp/preflight.py`，未入库），避免再出现“92.7% 挤一档”那种跑完才发现的事。
 - **把没进管线的字段/文件囊括进来（用户 2026-09-22 定：这次都囊括）** —— 盘点与实测统计见 `docs/dataset_notes.md`「未进管线的字段与文件」，分四阶段：
-  - **阶段 1（数据层，A/B 各 1~2 分钟，不训练、不破坏现有数字）**：`02_build_splits.py` 给 listens 的 splits 补三列（`is_organic` / `played_ratio_pct` / `track_length_seconds`，**正样本定义与行集合不变**）；另存 `feedback.parquet`（四个反馈合并 + event_type）、`weak_negative.parquet`（`played_ratio_pct < 50` 那 36.6%）、`item_artist.parquet` / `item_album.parquet`（只覆盖 627,648 个 item）。
+  - ~~**阶段 1（数据层，A/B 各 1~2 分钟，不训练、不破坏现有数字）**~~ **已完成（2026-09-22，见「已完成」27）**：`02_build_splits.py` 给 listens 的 splits 补三列（`is_organic` / `played_ratio_pct` / `track_length_seconds`，**正样本定义与行集合不变**）；另存 `feedback.parquet`（四个反馈合并 + event_type）、`weak_negative.parquet`（训练窗口内 `played_ratio_pct < 50`）、`item_artist.parquet` / `item_album.parquet`（只覆盖该口径训练集的物品）。
   - **阶段 2（评测层，改 `rec_eval.py`，用现有 checkpoint 就能算）**：加**分层轴**——按 `is_organic`（主动发现 / 推荐驱动）与目标参与度分桶报指标；先回答“模型在主动发现这条轴上是否更差”。
   - **阶段 3（模型层，一次一臂）**：A 难负样本（dislikes + 那 36.6% 的 `<50` 弱负反馈 + 高流行非交互）；B 正样本按 `played_ratio_pct` / likes 加权；C `is_organic` 当事件特征；D **艺人 / 专辑 embedding 与艺人流行度**（押注：这条最可能动新歌轴）。
   - **阶段 4（可选、最重）**：下载 `embeddings.parquet`（13.8 GB）做内容特征。
@@ -158,7 +161,8 @@
 | 时间通道的默认形态选**连续编码**（t2v / mlp / interp），不选分位档 | 只读检查预言（区分度：连续 0.96 vs 分位档 0.12）、五臂实测坐实（连续三条 +2.7~5.1%，均超噪声带；分位档那版早已退化） |
 | `time_t2v` 第一版失败归因：**尺度**，不是想法 | 实测该通道初始 RMS 2.034 vs item 0.018（113 倍）→ LayerNorm 压掉 item 信号；修法=去线性项/去相位 + Bochner `sqrt(1/(2·EMB))` 归一 → 0.040371 → 0.096083 |
 | 时间衰减用**强先验**（每 head 一个 λ），不用自由表 | 2 个参数 +1.3% vs 26 个参数（13 桶 × head 的自由 b 表）−4.4%；与 itemknn 的 τ^Δ（零学习纯衰减）互相印证。λ 学出正值（0.318/0.332） |
-| 未进管线的字段一律**先补进 artifacts、不改正样本定义** | 补列不破坏旧数字，可继续用现有基线对照；一旦改行集合/正样本定义，整张历史表作废 |
+| 未进管线的字段一律**先补进 artifacts、不改正样本定义** | 补列不破坏旧数字，可继续用现有基线对照；一旦改行集合/正样本定义，整张历史表作废（2026-09-22 阶段 1 已按这条落地，`02_build_splits.py` 加三列 + 四张表，三个基线数字逐项未变） |
+| 模型侧实验一律在**原始架构 d64/2（输入只有 item + position）**上做 | 用户 2026-09-22 定：这样能直接与已有 baseline 对比；位置通道收尾 / 容量包归因 / dropout 早停 / 口径 B 容量包都不应先改架构 |
 | 显式反馈与“点开就划走”都是监督信号，不是丢弃物 | dislike = 明确负反馈（可当难负样本）；`played_ratio_pct < 50` 的 36.6% 是弱负反馈；现在只用了 Listen+ 阈值，其余全丢 |
 
 ## 本轮（2026-09-21）要点
@@ -226,8 +230,8 @@
 ## 数据与产物状态
 
 - `data/raw/`（gitignore，454 MB）：`flat/50m/{listens,likes,dislikes,unlikes,undislikes}.parquet` + `album_item_mapping` / `artist_item_mapping`；sha256 已核对。
-- `artifacts/splits/`（gitignore）：`train.parquet` 199.7 MB、`val.parquet` 0.8 MB、`test.parquet` 0.9 MB、`uid_map.parquet`、`item_map.parquet`。
-- `artifacts/splits_b/`（gitignore）：版本 B（`val_size=0`）的切分，`train.parquet` 200.7 MB + `test.parquet` + 两张映射表；**没有 val**。
+- `artifacts/splits/`（gitignore）：`train.parquet` 243.3 MB、`val.parquet` 1.1 MB、`test.parquet` 1.1 MB、`uid_map.parquet`、`item_map.parquet`，以及 2026-09-22 阶段 1 加的四张表（`feedback.parquet`、`weak_negative.parquet` 1,650 万行、`item_artist.parquet`、`item_album.parquet`）；train 从 199.7 → 243.3 MB 就是因为补了三列。
+- `artifacts/splits_b/`（gitignore）：版本 B（`val_size=0`）的切分，`train.parquet` 244.6 MB + `test.parquet` + 两张映射表 + 同样的四张附加表；**没有 val**。
 - `artifacts/eda/`（gitignore）：6 张 PNG。
 - `scripts/05_itemknn.py`、`scripts/rec_eval.py`：只出终端数字，不落产物（itemknn 一档约 1 分 20 秒，13 档约 16 分钟）。
 - `artifacts/sasrec/`（gitignore）：`state.pt` = **最近一次训练**（每次训练都被覆写；2026-09-22 收尾时是 `POS_MODE=time_t2v` 那臂、d64/2 层）——它不是“当前最好”，别照着它报数；当前最好配置（seq 512 / emb 128 / 4 层，val recall@100 0.121823 / test 0.110816）的权重在 `state_l512_d128_l4.pt`。其余保留：`state_l512_d64.pt`（档案 0.100252 的来源，跨 session 诊断靠它）、`state_b.pt`（口径 B / d64/512/2 层）、`state_l512_d64_delta.pt`、`state_l512_d64_timebias.pt`、`state_l512_d64_idx.pt` / `state_l512_d64_pos_time.pt`，以及 09-22 第二轮五臂的 `state_d64_{idx,tmlp,tt2v,tt2v_fix,tinterp,decay}.pt`。换序列长度、维度、层数、Δ 开关、相对时间偏置开关、`POS_MODE` 或 `USE_DECAY` 都会让旧 checkpoint 装不回去（**7 处守卫**，给可读提示）。
