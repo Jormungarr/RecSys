@@ -9,33 +9,37 @@
 
 **这一节是给下一个 agent 的入口**：只读这一节就能接着干；细节在下面各节与 `docs/baselines.md`。
 
-**当前最好组合**：sasrec，`MAX_SEQ_LEN=512` / `EMB=128` / `LAYERS=4`（其余：heads 2、dropout 0.0、lr 1e-3、Adam、batch 256、seed 42、50 epoch）；四个时间相关开关都关（`USE_TIME_FEATURE` / `USE_TIME_BIAS` / `POS_MODE="index"` / `USE_DECAY=False`）。**权重**在 `artifacts/sasrec/state_l512_d128_l4.pt`；脚本常量是**滚动**的：2026-09-22 第二轮的位置通道五臂对照用的是 `EMB=64 / LAYERS=2`（见「已完成」22）。
+**当前最好组合（2026-09-23）**：sasrec，`MAX_SEQ_LEN=512` / `EMB=128` / `LAYERS=4` + `POS_MODE="time_t2v"`（连续时间刻度**替换**位置序号）；其余：heads 2、dropout 0.0、lr 1e-3、Adam、batch 256、seed 42、50 epoch；`USE_TIME_FEATURE` / `USE_TIME_BIAS` / `USE_DECAY` 都关。**权重**在 `artifacts/sasrec/state_l512_d128_l4_tt2v.pt`（= 现在的 `state.pt`）。**脚本默认常量就是这一组**（直接跑 = 最佳组合）；`MAX_SEQ_LEN` / `EMB` / `LAYERS` / `POS_MODE` 都可用环境变量覆盖，一条命令里能背靠背跑多臂（见「已完成」35）。
 
 **比较规则（2026-09-22 起，硬规矩）**：训练在 MPS 上**跨 session 不可复现**（同配置同 seed 差 9~11%，见 `docs/baselines.md`「跨 session 不可复现」），所以**所有对照必须在同一条命令里背靠背跑**；档案里的绝对值（0.100252、0.121823…）只能当"那一次 session 的抽样"。同 session 内三次同配置重复的极差是 **0.85%**，所以 <1% 的差异判不了。另：**loss 不能替代指标**——那三次重复的 epoch 50 loss 逐位相同，指标却差 0.85%。
 
-**当前数字**（口径 A，候选池 627,648，不过滤已交互物品；**这两行是 2026-09-21 那个 session 的**，按上面的规则不能与今天的 session 直接比）
+**当前数字**（口径 A，候选池 627,648，不过滤已交互物品）。**每一行只能和同一 session 里的另一行比**（见上面的规则）：
 
-| | recall@100 | 命中率@100 | 回访 recall@100 | 新歌 recall@100 |
-|---|---|---|---|---|
-| val（4,627 用户） | **0.121823** | 0.685974 | **0.149584** | 0.049653 |
-| test（4,599 用户） | **0.110816** | 0.650359 | **0.139891** | 0.045000 |
+| session | 配置 | val recall@100 | test recall@100 |
+|---|---|---|---|
+| 2026-09-23 | 基线＝官方配置那一档（200/64/2 + `index`） | 0.079223 | 0.074322 |
+| 2026-09-23 | **最佳组合（512/128/4 + `time_t2v`）** | **0.118279** | **0.111260** |
+| 2026-09-21 | 容量包（512/128/4 + `index`） | 0.121823 | 0.110816 |
 
-两条轴、两个窗口都是 sasrec 第一（对照：val itemknn 0.103341 / popularity 0.047727；test itemknn 0.098117 / popularity 0.046988）。**但新歌轴只是追平 popularity（test +0.4%），不是领先。**
+2026-09-23 这两行是**同一条命令背靠背**跑出来的：最佳组合比官方配置那一档 **+49.3%（val）/ +49.7%（test）**，命中率@100 0.575967 → 0.673655，回访 +50.6% / +50.4%，新歌 +33.4% / +24.6%（完整表见 `docs/baselines.md`「官方配置那一档 vs 最佳组合」）。
+**注**：09-21 那一行的 0.121823 比 09-23 最佳组合的 0.118279 高，但两者不是同一个 session → 按规则**不能相减**。
+对照的非训练基线（popularity / itemknn）是**确定性**的（同日重跑逐项未变），可以直接比：val itemknn 0.103341 / popularity 0.047727，test itemknn 0.098117 / popularity 0.046988 —— 09-23 两行都比它们高；**新歌轴仍是短板**（最佳组合 test 新歌 0.043407 vs popularity 0.0448），没有领先。
 
-**这个"最好"的四个弱点（别过度声称）**
+**这个“最好”的弱点（别过度声称）**
 
-1. `MAX_SEQ_LEN=512` 这一项证据最弱：200 → 512 的对照是在 NaN 缺陷下测的，修正后没重跑，现在只有方向性结论 + EDA 动机（历史长度中位 666、截到 200 时一半用户被砍）。
-2. **跨 session 不可复现**（今天定量：同配置差 9~11%，机制未解释）→ 只有同 session 对照才算数。
+1. **缺控制臂**：09-23 只跑了“官方配置那一档”与“容量包 + t2v”两臂，**没有** `d128/4 + index` 那一臂 → “时间通道在容量包之上有增益”**没有证据**。
+2. **跨 session 不可复现**（已定量：同配置差 9~11%，机制未解释）→ 只有同 session 对照才算数；但**非训练基线（popularity / itemknn）是确定性的**，同日重跑逐项未变，所以可以直接比。
 3. **单 seed 42**：同 session 噪声带 0.85%（3 次重复），跨 session 更大。
-4. **口径 B 没跟上**：B 上的 sasrec 还是 d64 / 2 层（修正后 0.094515），"能对官方表"与"当前最好"目前是两个配置。
+4. `MAX_SEQ_LEN=512` 这一项证据最弱：200 → 512 的对照是在 NaN 缺陷下测的，修正后没重跑，现在只有方向性结论 + EDA 动机（历史长度中位 666、截到 200 时一半用户被砍）。
+5. **口径 B 没跟上**：B 上的 sasrec 还是 d64 / seq512 / 2 层（修正后 0.094515），“能对官方表”与“当前最好”目前是两个配置。
 
-**下一步建议顺序**（每步只改一处，且必须同 session 背靠背）：**阶段 1（数据层，见「已完成」27）、阶段 2（评测层，见 28）、阶段 3（模型层三臂 A/B/C，见 29/30/31）都已做完；D 检查后不做（见 32）**
-→ 下一步：① 位置通道的收尾（重复 mlp / t2v、上 d128/4 验证）→ ② 拆开 EMB / 层数把容量包归因 → ③ dropout / 早停 → ④ 口径 B 的容量包。
-另两条独立线：**排名融合重做**（旧结论已作废，需同 session 重算三模型 top-100）、**内容特征/音频嵌入**（等网络恢复再说，且要先定冷物品口径）。
+**下一步建议顺序**（每步只改一处，且必须同 session 背靠背）：阶段 1 / 2 / 3 与 D 检查都已做完（见「已完成」27-32），09-23 又做了「官方配置档 vs 最佳组合」两臂（见 34）。
+→ 下一步：① **补 `d128/4 + index` 控制臂**（同 session，约 45 分钟）→ ② **口径 B 的两臂**（才能对官方 0.0828）→ ③ 拆开 EMB / 层数把容量包归因 → ④ dropout / 早停。
+另两条独立线：**排名融合重做**（旧结论已作废，需同 session 重算三模型 top-100）、**内容特征/音频嵌入**（权重已下到 `data/raw/embeddings.parquet`，见 36；要先定冷物品口径）。
 
-**用户 2026-09-22 定的口径（模型侧）**：位置通道收尾 / 容量包归因 / dropout 早停 / 口径 B 容量包**现在都不做**；之后所有模型实验一律在**原始架构 d64/2（输入只有 item + position）**上做，这样能直接与已有 baseline 对比，不另开对照组。
+**用户口径的两次改动（别搞混）**：2026-09-22 定“之后所有模型实验一律回到原始架构 d64/2”；**2026-09-23 改成“只跑两臂对照：基线用官方配置那一档（200/64/2），另一臂把容量包 + seq512 + 时间通道全叠上，不考虑归因”**（见 34）。
 
-**读什么**：`architecture.md`（数据流与 A / B 口径）、`docs/baselines.md`（三个模型的数字、NaN 缺陷说明、两个新实验）、`docs/eda.md`（数据动机）、`docs/dataset_notes.md`（数据集事实与坑）；协作规则在 `AGENTS.md`。sasrec 一轮 50 epoch：d128/4 ≈ 45 分钟，**按脚本当前常量（d64/2）≈ 13 分钟**（MPS 训练 / CPU 推理；长时任务用 `bg-train` skill；自报时间不含机器 Idle Sleep）。
+**读什么**：`architecture.md`（数据流 + **「两套口径（A / B）」**：边界、时间线、能不能对官方表）、`docs/baselines.md`（三个模型的数字、NaN 缺陷说明、各轮实验）、`docs/eda.md`（数据动机）、`docs/dataset_notes.md`（数据集事实与坑）；协作规则在 `AGENTS.md`。sasrec 一轮 50 epoch（MPS 训练 / CPU 推理）：**按脚本当前常量（512/128/4 + t2v）≈ 39 分钟**、d64/2 ≈ 13 分钟、官方配置那一档（200/64/2）≈ 5 分钟；长时任务用 `bg-train` skill；自报时间不含机器 Idle Sleep。
 
 ## 进度
 
@@ -111,9 +115,22 @@
   `docs/baselines.md` 加目录与“实验部分在文件后半”的说明，并在「跨 session 不可复现」补一条同日定量：
   三次同配置基线 val 极差 **0.14%** / test 极差 **0.50%**（同一 checkpoint 复评逐位相同 → 全来自训练噪声，读 test 要比 val 宽松）。
   索引（`AGENTS.md`、`architecture.md`）同步。
+34. **官方配置那一档 vs 最佳组合（两臂同 session，口径 A）**（2026-09-23）：把基线拉回**官方默认的模型形状**（`seq200/64/2 + index`），
+  另一臂把容量包（512/128/4）与位置通道 `time_t2v` 叠起来。**基线 val 0.079223 / test 0.074322 → 最佳组合 val 0.118279 / test 0.111260（+49.3% / +49.7%）**；
+  命中率@100 0.575967 → 0.673655、回访 +50.6% / +50.4%、新歌 +33.4% / +24.6%、coverage(全用户) 0.022090 → 0.044332；两臂 loss 0.0477 → 0.024728。
+  权重：`state_l200_d64_l2_idx.pt` / `state_l512_d128_l4_tt2v.pt`（后者也是现在的 `state.pt`，与脚本默认常量一致）。
+  边界：口径 A，**不能对官方表**；没有 `d128/4 + index` 控制臂 → 归因空缺；09-21 那版 val 0.121823 高于本版 0.118279，但跨 session 不能相减。
+  → `docs/baselines.md`「官方配置那一档 vs 最佳组合」、`README.md` 第 16 行 + 「关键指标对比」。
+35. **三个常量改成可环境变量覆盖**（2026-09-23）：`MAX_SEQ_LEN` / `EMB` / `LAYERS`（此前只有 `POS_MODE` / `USE_DECAY` / `USE_ORGANIC`）。
+  动机：两臂的模型形状不同，硬编码就放不进同一条命令，而“同 session 背靠背”是硬规矩。同时把**脚本默认常量改成最佳组合那一组**（现在“直接跑” = 最佳组合）。
+  8 处守卫读的是**解析后的最终值**，所以覆盖后一样受守卫。开工前用只读探针核对了“默认 / 覆盖”两种解析结果，并用 **1 epoch 端到端冒烟**验过两个配置都能跑通（权重写 `smoke_state.pt`、跑完已删；32.6 s / 111.1 s）。
+36. **`embeddings.parquet` 下载**（2026-09-23）：13,814,230,943 字节（12.87 GiB），HF LFS sha256 = `c8959a58…811c83` → `data/raw/`；
+  带断点续传（`curl -C -`，最多 6 轮）→ 字节数核对 → sha256 核对 → 通过才改名。第 1 次 curl 在 1.74 GB 处 rc=92 被掐，续传逻辑按设计接手。
+  状态与校验结果见「数据与产物状态」最新一行。
 
 **待办**
 
+- **2026-09-23 新开的两条（按顺序）**：① **补 `d128/4 + index` 控制臂**（同一条命令带上官方配置那一档基线，约 45 分钟）——不补的话“时间通道在容量包之上有没有增益”永远是空缺；② **口径 B 的两臂**（`train b`：基线 ~5 分钟 + 最佳组合 ~45 分钟）——唯一能对上官方 0.0828 的路。
 - ~~sasrec 加时间特征~~：**两项都做完，结论都是“变差”**（2026-09-21）——① Δ 嵌入（进 token 表示）−5.6%、② 相对时间偏置（进注意力 logits）−4.4%，两个开关都留着、**默认关**；会话边界经确认**不做**。但 2026-09-22 的开工前检查给这两条失败加了限定：两者的分辨率都只有 **13 桶**、偏置还只是“每 head 一个标量”，所以**这两个负面结论只对弱实现成立**，不能宣布“时间无用”。
 - **时间通道：第二轮已跑完（2026-09-22，d64/2，五臂同一条命令背靠背）** —— 结果与判据见 `docs/baselines.md`「位置通道四种形态 + 衰减核」：
 
@@ -151,7 +168,7 @@
     三个臂都有没试的旋钮（A：`HARD_SHARE` 降到 0.1~0.2 / 只用观测到的负反馈；B：**拆开 ratio 与 like**；C：当分层损失权重用 / 与推荐驱动配对）。
     **下一步 D**：**艺人 / 专辑 embedding 与艺人流行度**（押注：这条最可能动新歌轴，但参数最多：艺人 8.3 万 × 64 ≈ 530 万、
     专辑 34.3 万 × 64 ≈ 2200 万）。物料已备（`item_artist` / `item_album` 覆盖 99.57% / 99.96% 物品）。一律在 d64/2 原始架构上做。
-  - **阶段 4（可选、最重）**：下载 `embeddings.parquet`（13.8 GB）做内容特征。
+  - **阶段 4（可选、最重）**：~~下载 `embeddings.parquet`（13.8 GB）~~ **2026-09-23 已下载并校验**（见「已完成」36）；剩下的是真正做内容特征 + 定义冷物品口径。
   - 纪律：**评测目标定义不变**（val/test 仍 Listen+，否则整张历史表作废）；三个基线先都不动（新字段只让 sasrec 侧试），避免“模型换了、对照也换了”。
 - **index 粗化对照**（排除“粗化”这个混淆）：用户 2026-09-22 决定**不做**；代价是 time vs index 的归因永远分不清是“时间刻度”还是“粗化”，只能当组合结论。
 - **D（艺人 / 专辑 embedding）不做**（2026-09-22 检查后定，见「已完成」32）：
@@ -294,12 +311,13 @@
 
 ## 数据与产物状态
 
-- `data/raw/`（gitignore，454 MB）：`flat/50m/{listens,likes,dislikes,unlikes,undislikes}.parquet` + `album_item_mapping` / `artist_item_mapping`；sha256 已核对。
+- `data/raw/`（gitignore）：`flat/50m/{listens,likes,dislikes,unlikes,undislikes}.parquet` + `album_item_mapping` / `artist_item_mapping`（454 MB；sha256 已核对）；**2026-09-23 新增 `embeddings.parquet`（13.8 GB / 12.87 GiB，音频嵌入）**，单独一条见下。
+- `data/raw/embeddings.parquet`（gitignore）：音频嵌入，13,814,230,943 字节（12.87 GiB），HF LFS sha256 = `c8959a58…811c83`。**状态（2026-09-23 12:00）：下载中（~32%）**——脚本自带断点续传（`curl -C -`，最多 6 轮）→ 字节数核对 → sha256 核对，通过才改名成正式文件；完成后本节更新为“已校验”。
 - `artifacts/splits/`（gitignore）：`train.parquet` 243.3 MB、`val.parquet` 1.1 MB、`test.parquet` 1.1 MB、`uid_map.parquet`、`item_map.parquet`，以及 2026-09-22 阶段 1 加的四张表（`feedback.parquet`、`weak_negative.parquet` 1,650 万行、`item_artist.parquet`、`item_album.parquet`）；train 从 199.7 → 243.3 MB 就是因为补了三列。
 - `artifacts/splits_b/`（gitignore）：版本 B（`val_size=0`）的切分，`train.parquet` 244.6 MB + `test.parquet` + 两张映射表 + 同样的四张附加表；**没有 val**。
 - `artifacts/eda/`（gitignore）：6 张 PNG。
 - `scripts/05_itemknn.py`、`scripts/rec_eval.py`：只出终端数字，不落产物（itemknn 一档约 1 分 20 秒，13 档约 16 分钟）。
-- `artifacts/sasrec/`（gitignore）：`state.pt` = **最近一次训练**（每次训练都被覆写；2026-09-22 阶段 3 收尾时是 **is_organic 事件特征那一臂的基线** `state_d64_o_off.pt`）——它不是“当前最好”，别照着它报数；当前最好配置（seq 512 / emb 128 / 4 层，val recall@100 0.121823 / test 0.110816）的权重在 `state_l512_d128_l4.pt`。其余保留：`state_l512_d64.pt`（档案 0.100252 的来源，跨 session 诊断靠它）、`state_b.pt`（口径 B / d64/512/2 层）、`state_l512_d64_delta.pt`、`state_l512_d64_timebias.pt`、`state_l512_d64_idx.pt` / `state_l512_d64_pos_time.pt`，09-22 第二轮五臂的 `state_d64_{idx,tmlp,tt2v,tt2v_fix,tinterp,decay}.pt`，阶段 3 的三组：`state_d64_neg_{uniform,hard}.pt`、`state_d64_w_{uniform,feedback}.pt`、`state_d64_o_{off,on}.pt`。换序列长度、维度、层数、Δ 开关、相对时间偏置开关、`POS_MODE`、`USE_DECAY` 或 `USE_ORGANIC` 都会让旧 checkpoint 装不回去（**8 处守卫**，给可读提示）；`NEG_MODE` 与 `WEIGHT_MODE` 只改训练、不改推理，所以没有守卫、各臂权重可以互相换。
+- `artifacts/sasrec/`（gitignore）：`state.pt` = **最近一次训练**（每次训练都被覆写）；2026-09-23 起它 = **最佳组合那一臂**（`state_l512_d128_l4_tt2v.pt` 的拷贝，与脚本默认常量一致，所以 `test` 能直接跑）。当前最好配置（512/128/4 + `time_t2v`，val 0.118279 / test 0.111260）的权重就在 `state_l512_d128_l4_tt2v.pt`；09-21 那版容量包（512/128/4 + index，val 0.121823 / test 0.110816）在 `state_l512_d128_l4.pt`；09-23 的基线（200/64/2 + index）在 `state_l200_d64_l2_idx.pt`。其余保留：`state_l512_d64.pt`（档案 0.100252 的来源，跨 session 诊断靠它）、`state_b.pt`（口径 B / d64/512/2 层）、`state_l512_d64_delta.pt`、`state_l512_d64_timebias.pt`、`state_l512_d64_idx.pt` / `state_l512_d64_pos_time.pt`，09-22 第二轮五臂的 `state_d64_{idx,tmlp,tt2v,tt2v_fix,tinterp,decay}.pt`，阶段 3 的三组：`state_d64_neg_{uniform,hard}.pt`、`state_d64_w_{uniform,feedback}.pt`、`state_d64_o_{off,on}.pt`。换序列长度、维度、层数、Δ 开关、相对时间偏置开关、`POS_MODE`、`USE_DECAY` 或 `USE_ORGANIC` 都会让旧 checkpoint 装不回去（**8 处守卫**，给可读提示）；`NEG_MODE` 与 `WEIGHT_MODE` 只改训练、不改推理，所以没有守卫、各臂权重可以互相换。
 - `vendor/yambda-benchmarks/`（gitignore）：上游 clone，含自己那套 `.venv`。
 - 仓库前 8 个 commit 属于 2026-09-21 之前那一轮（初始化 / val+test 双窗口 / 口径 B / 自写注意力 block + NaN 修复 / 相对时间偏置 / 容量包 / 归档 / 交接存档）；2026-09-22 的四个步骤**各一个 commit**——`50587b3` 文档与现状对齐、`a0bc75d` 阶段 1 数据层、`36ec316` 阶段 2 评测分层轴、`f08dfbf` 阶段 3 第一臂（难负样本），另有零星的文档数目订正 commit（不逐个数）。
 
@@ -310,4 +328,5 @@
 - **2026-09-22 清理**：删掉 `artifacts/sasrec/state_l512_d256.pt`（扩容那版，数字受 NaN 缺陷污染、配置已被容量包取代）与 `state_l200.pt`（seq 200，同样受污染且已被 512 取代）；bgtrain 任务目录 `d128_idx`（被中止的对照）与 `demo` 也清掉。保留：`state_l512_d64.pt`（档案 0.100252 的来源，跨 session 诊断靠它）、`state_l512_d128_l4.pt`（当前最好）、`state_b.pt`（口径 B）、以及今天两版时间通道的权重。
 - 本轮的一次性脚本都只在 `/tmp`（`preflight.py` 并列/间隔/区分度、`check_pos_mode.py`、`check_forms.py` 五形态+衰减核自检、`t2v_scale.py` 通道幅度诊断、`eval_ckpt.py` 复评历史 checkpoint、`example_positions.py` / `anchor.py` 两种模式给什么行号、`bench_*.py` 单步剖分与提速杠杆、阶段 2 的“按 is_organic 拆目标”的只读核算），**没有入库**——按约定“一次性的验证不固化成脚本”。
 - **2026-09-22 checkpoint 交换**：`state.pt` 现在是 `state_d64_idx.pt` 的副本（阶段 2 的评测要 d64/2 + `POS_MODE=index`）；换之前 `cmp` 过 t2v 那臂与 `state_d64_tt2v_fix.pt` 逐位相同，没丢权重。
+- **2026-09-23 checkpoint 交换两次**：两臂跑完后 `state.pt` = 最佳组合（`state_l512_d128_l4_tt2v.pt` 的拷贝，与脚本默认常量一致）；为了补基线臂的 test，临时把 `state_l200_d64_l2_idx.pt` 拷回 `state.pt` 跑完 test 后**立即还原**（`cmp` 校验一致）。
 - 权重目录现有：`state_l512_d128_l4.pt`（最强）、`state_l512_d64.pt`（档案 0.100252 的来源）、`state_b.pt`（口径 B）、`state_l512_d64_idx.pt` / `_pos_time.pt`、以及第二轮五臂的 `state_d64_{idx,tmlp,tt2v,tt2v_fix,tinterp,decay}.pt`。

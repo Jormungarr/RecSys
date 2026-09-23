@@ -97,13 +97,14 @@ assert SPLITS_ID in ("a", "b"), f"口径只能是 a 或 b，收到 {SPLITS_ID!r}
 SPLITS = ROOT / "artifacts" / ("splits" if SPLITS_ID == "a" else "splits_b")
 CHECKPOINT = ROOT / "artifacts" / "sasrec" / ("state.pt" if SPLITS_ID == "a" else "state_b.pt")
 
-MAX_SEQ_LEN = 512  # 官方默认 200；本机改 512 —— 训练集历史长度（去重物品）中位 666 / p90 2,239（docs/eda.md），
-                   # 截到 200 时一半以上用户的历史被砍掉（实测：两个口径下序列长度中位都正好 = 200，即顶到上限）
-EMB = 64  # 官方默认 64。2026-09-22（第二轮）为了「位置通道四种形态 + 衰减核」的五臂对照临时回到 64/2 层：
-          # 每臂 ~13 分钟、五臂背靠背；代价是结论只在 d64/2 上成立（是否上 d128/4 等这批结果再定）。
-          # 当前最强配置（emb 128 + 4 层）的权重在 state_l512_d128_l4.pt
+MAX_SEQ_LEN = int(os.environ.get("MAX_SEQ_LEN", "512"))  # 默认 512：训练集历史长度（去重物品）中位 666 / p90 2,239
+                   # （docs/eda.md），截到 200 时一半以上用户的历史被砍掉。2026-09-23 起支持环境变量覆盖：
+                   # 两臂对照的**基线**用官方那档 200（官方默认），最佳组合用 512，硬编码放不进同一条命令。
+EMB = int(os.environ.get("EMB", "128"))  # 官方默认 64。默认 = 最佳组合那一档（128/4 层 + time_t2v 位置通道）；
+           # 2026-09-23 起支持环境变量覆盖：两臂对照的 EMB/LAYERS 不同（d64/2 vs d128/4），硬编码放不进同一条命令。
+           # 2026-09-22 那轮五臂对照用的是 64/2，结论只在 d64/2 上成立；d128/4 那一版的旧权重在 state_l512_d128_l4.pt
 HEADS = 2
-LAYERS = 2  # 官方默认 2；与 EMB=64 一起构成本轮五臂对照的配置，理由见 EMB 处
+LAYERS = int(os.environ.get("LAYERS", "4"))  # 官方默认 2；与 EMB=128 一起 = 容量包（见 docs/baselines.md「容量包」）
 DROPOUT = 0.0
 USE_BF16 = False  # 训练步用 bf16 自混精。微基准：d128/4 层上单步 1110 → 967 ms（同进程交替测 4 轮，−13%）；
                   # 但 2026-09-22 在 d64/2 层上真跑：epoch 耗时与 fp32 相同（无收益），val recall@100 0.091862
@@ -139,7 +140,8 @@ USE_TIME_BIAS = False  # 相对时间偏置开关：b[Δt 桶]（可学，按 he
                       # 回访 −4.9%、新歌 −2.8%），但学出的 b 表本身是干净的单调衰减（1min–30min 最高、6 桶后单调降到 −1.4）
                       # → 先验没错，是它和位置 embedding 重复且更弱。见 docs/baselines.md。默认 False。**
                       # checkpoint 里有无 time_bias 必须与开关一致，下有守卫。
-POS_MODE = os.environ.get("POS_MODE", "index")  # 位置通道。可用环境变量覆盖，方便一条命令里连跑多臂
+POS_MODE = os.environ.get("POS_MODE", "time_t2v")  # 位置通道。可用环境变量覆盖，方便一条命令里连跑多臂
+                    # 默认 = time_t2v：2026-09-23 两臂对照里的**最佳组合**那一臂；基线那一臂是 POS_MODE=index（序数刻度）
                     # index       = 位置索引查表（基线）：下标 = 「距查询点第几首」(0..511)
                     # time        = 用时间替换位置：下标 = Δ 的**等量分位档号**（整数，512 档；实测每用户只有 ~56 档）
                     # time_interp = 同上，但下标是**小数**（桶内按 log1p 插值到相邻两行），不新增参数
